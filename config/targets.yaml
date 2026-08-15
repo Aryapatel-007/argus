@@ -1,0 +1,30 @@
+models:
+  chat: qwen3.5:9b
+  fast: phi4-mini
+  embed: nomic-embed-text
+
+ollama:
+  host: "http://127.0.0.1:11434"
+  num_ctx: 4096
+
+targets:
+  - id: monash_ai_masters
+    name: "Monash Master of Artificial Intelligence"
+    url: "https://www.monash.edu/study/courses/find-a-course/artificial-intelligence-c6001"
+    type: program
+    frequency: weekly
+    extract: [intake_dates, duration, fees, entry_requirements]
+
+  - id: rmit_ai_masters
+    name: "RMIT Master of Artificial Intelligence"
+    url: "https://www.rmit.edu.au/study-with-us/levels-of-study/postgraduate-study/masters-by-coursework/master-of-artificial-intelligence-mc267"
+    type: program
+    frequency: weekly
+    extract: [intake_dates, duration, fees, entry_requirements]
+
+  - id: homeaffairs_skilled_visa
+    name: "Australian Home Affairs — skilled migration news"
+    url: "https://immi.homeaffairs.gov.au/what-we-do/skilled-migration-program"
+    type: policy
+    frequency: weekly
+    extract: [announcement_title, announcement_date, summary]
