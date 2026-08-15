@@ -4,11 +4,13 @@ Run: python scripts/smoke_test.py
 Requires `ollama serve` running locally.
 """
 
-import time
+import sys
 from pathlib import Path
 
 import yaml
 from ollama import Client
+
+NS_PER_S = 1_000_000_000
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "targets.yaml"
 CHAT_PROMPT = "In one sentence, what does a task scheduler do?"
@@ -24,18 +26,40 @@ def main() -> None:
     client = Client(host=ollama_cfg["host"])
 
     try:
-        start = time.perf_counter()
         chat_response = client.chat(
             model=models["chat"],
             messages=[{"role": "user", "content": CHAT_PROMPT}],
             options={"num_ctx": ollama_cfg["num_ctx"]},
         )
-        latency = time.perf_counter() - start
+
+        eval_count = chat_response.eval_count
+        eval_duration = chat_response.eval_duration
+        tokens_per_second = (
+            eval_count / (eval_duration / NS_PER_S)
+            if eval_count and eval_duration
+            else None
+        )
 
         print(f"--- chat model: {models['chat']} ---")
         print(f"reply: {chat_response.message.content}")
-        print(f"latency: {latency:.2f}s")
-        print(f"tokens generated (eval_count): {chat_response.eval_count}")
+        print(
+            "model load / swap cost: "
+            f"{chat_response.load_duration / NS_PER_S:.2f}s"
+        )
+        print(
+            f"prompt_eval_count: {chat_response.prompt_eval_count}, "
+            f"prompt_eval_duration: {chat_response.prompt_eval_duration / NS_PER_S:.2f}s"
+        )
+        print(
+            f"eval_count: {eval_count}, "
+            f"eval_duration: {eval_duration / NS_PER_S:.2f}s"
+        )
+        print(
+            f"tokens/sec: {tokens_per_second:.2f}"
+            if tokens_per_second is not None
+            else "tokens/sec: n/a"
+        )
+        print(f"total_duration: {chat_response.total_duration / NS_PER_S:.2f}s")
 
         embed_response = client.embed(model=models["embed"], input=EMBED_TEXT)
         vector_length = len(embed_response.embeddings[0])
@@ -48,6 +72,7 @@ def main() -> None:
             "\nCould not reach Ollama. Check that `ollama serve` is running "
             f"and reachable at {ollama_cfg['host']}."
         )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
