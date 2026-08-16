@@ -35,4 +35,5 @@ metadata.
 
 ---
 
-This is Sprint 0. See `CLAUDE.md` for full architecture and current state.
+This is Sprint 1. See `CLAUDE.md` for full architecture and current state, and
+`notes/` for sprint-by-sprint measurements.

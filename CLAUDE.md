@@ -5,7 +5,7 @@ Local-first autonomous multi-agent monitoring system. Watches a list of targets
 finds, detects changes, and proposes actions that always wait for human approval.
 
 Solo project, built by a BTech CSE student as a portfolio centerpiece. Built in
-sprints, currently Sprint 0.
+sprints, currently Sprint 1.
 
 ---
 
@@ -35,17 +35,39 @@ exception is intended.
 - Python 3.11.9
 - NVIDIA driver 610.88, CUDA 13.3
 
-**Measured, not assumed:** `qwen3.5:9b` at Q4_K_M needs ~8.2GB total (4.0GB GPU
-weights + 2.2GB output layer + 1.4GB KV cache + 0.55GB compute graph). This does
-not fit in 7.6GB. Ollama pushes the output layer to CPU, producing a ~70/30
-GPU/CPU split and ~70s response times. Reducing context from 4096 to 2048 did
-not meaningfully help — the bottleneck is weights, not KV cache.
+**Measured, not assumed.** `qwen3.5:9b` at Q4_K_M needs ~8.2GB total (4.0GB GPU
+weights + 2.2GB output layer + 1.4GB KV cache + 0.55GB compute graph) against a
+~7.6GB ceiling. Ollama pushes the output layer to CPU. That is one layer of 33,
+but a disproportionately heavy one, which is why `ollama ps` reports a ~70/30
+GPU/CPU split. Layer count and memory share measure different things; both
+readings are correct.
 
-Open decision (Sprint 1): keep `qwen3.5:9b` with the CPU split, or drop to
-`qwen3.5:4b` (3.4GB) which fits cleanly. Untested lever: `OLLAMA_KV_CACHE_TYPE=q4_0`.
+Throughput ~19-21 tok/s on that split. Cold load 6.00s, warm 0.12s.
 
-**Assume VRAM is scarce.** Never assume two chat models can be resident
-simultaneously. Qwen 9B (6.6GB) + Phi-4-mini (2.5GB) = 9.1GB, which never fits.
+**Assume VRAM is scarce.** Two chat models never co-reside. Qwen 9B (6.6GB) +
+Phi-4-mini (2.5GB) = 9.1GB against 7.6GB. Every alternation costs a 6s reload.
+
+---
+
+## Thinking control — settled, do not rediscover
+
+`qwen3.5:9b` is a reasoning model. Unconstrained it spends nearly all generation
+on thinking. Measured (`notes/sprint1_thinking_probe.json`), one-sentence prompt:
+
+- thinking on (default): 1228-1561 eval tokens, 67-83s
+- `think=False`: 37 eval tokens, 2.1s
+
+~35x faster, ~97.6% of generation was reasoning.
+
+- `think="low"` is NOT a middle setting here. It is silently coerced to True and
+  produces byte-identical results to `think=True`. Thinking is binary on this
+  model. Do not use levels.
+- `format=` JSON schema composes with `think=False` at zero measured cost.
+- One `think=True` run went runaway: 6163 tokens, 1583s, **empty content**, with
+  tok/s collapsing to 3.9 under a heavier CPU offload. With thinking on,
+  generation length is unbounded and can return nothing at all. A weekly
+  scheduled system cannot contain a step that might take 26 minutes and yield
+  an empty string.
 
 ---
 
@@ -59,9 +81,11 @@ simultaneously. Qwen 9B (6.6GB) + Phi-4-mini (2.5GB) = 9.1GB, which never fits.
   - Memory server: `remember_fact`, `recall_facts`, `list_changes_since`
   - Browser server: `search`, `open_page`, `extract_structured`
 - **Models via Ollama:**
-  - Planner / writer / judge: `qwen3.5:9b` (see open decision above)
-  - Fast critic / router: `phi4-mini`
-  - Embeddings: `nomic-embed-text`
+  - Planner / critic / writer / judge: `qwen3.5:9b`
+  - `phi4-mini`: pulled, in the architecture, unused until Sprint 7 gives real
+    routing data. At 2.1s per call a swap to it costs 6s to save ~1s.
+  - Embeddings: `nomic-embed-text`, 768 dimensions (fixes sqlite-vec column
+    width in Sprint 2)
 - **Storage** — single SQLite file, WAL mode, sqlite-vec extension for vectors.
 
 ### Core loop, per target, per run
@@ -80,8 +104,10 @@ idempotency key generated and stored *before* the action runs.
 
 - `runs` — one row per scheduled execution
 - `tasks` — sub-tasks the planner generated within a run
-- `facts` — versioned knowledge per target, indexed on target_id, run_id, created_at
-- `approvals` — pending and resolved human decisions, including the reasoning
+- `checkpoints` — state after every transition
+- `llm_calls` — every Ollama call with latency, tok/s, token counts
+- `facts` — versioned knowledge per target (Sprint 2, migration 002)
+- `approvals` — pending and resolved human decisions (Sprint 2, migration 002)
 
 ---
 
@@ -90,6 +116,13 @@ idempotency key generated and stored *before* the action runs.
 - **Hand-built state machine before LangGraph.** Deliberate. The point is
   understanding what a checkpointer and idempotent retry actually solve. Do not
   suggest migrating to LangGraph during early sprints.
+- **Kept `qwen3.5:9b` despite the partial CPU offload.** Do not propose dropping
+  to 4b. The latency problem was thinking tokens, not model size or inference
+  speed. Smaller models are worse at structured output, which is exactly what
+  the planner and critic depend on.
+- **Single model for all roles in Sprint 1.** Zero swaps. Model bindings per role
+  come from config, so routing to `phi4-mini` later is a config change, not a
+  refactor.
 - **Local models over hosted APIs.** Accepted tradeoff: local models are worse at
   structured output. That is *why* deterministic validation and retry logic wrap
   every tool call and judge call.
@@ -110,7 +143,7 @@ argus/
   config/          targets.yaml — what Argus watches
   data/            SQLite file (gitignored)
   notes/           sprint measurements and findings
-  scripts/         one-off runners, smoke tests
+  scripts/         one-off runners, smoke tests, probes
   src/argus/
     orchestrator/  the plan-act-critique state machine
     servers/       MCP servers (memory, browser)
@@ -127,6 +160,14 @@ argus/
   MCP SDK, sqlite-vec, Browser Use, or APScheduler ahead of time — version drift
   before first use is a real cost.
 - Pin `mcp < 2` when the MCP SDK does get installed.
+- `think` is a TOP-LEVEL field on Ollama chat/generate, not inside `options`.
+  Pass `think=False` explicitly on EVERY call, every role. Never rely on the
+  default.
+- Never use `num_predict` as a thinking cap. With thinking on it truncates
+  mid-reasoning and returns no answer.
+- Every Ollama call needs a hard 120s timeout and must log tok/s. A degraded
+  CPU offload has been observed dropping throughput 5x mid-session.
+- The state transition and its checkpoint insert go in ONE transaction.
 - Async by default for anything I/O-bound. Use `httpx.AsyncClient`, never
   blocking `requests` inside an `async def`.
 - Model tags come from config, never hardcoded in source.
@@ -146,28 +187,42 @@ argus/
 - Don't re-teach LangChain, LangGraph, MCP, Playwright, or async Python at a
   beginner level — I know these.
 - Confirm each step worked before moving to the next.
+- Design decisions get made in a separate architect chat, not here. If you hit a
+  design question this file doesn't answer, stop and tell me rather than
+  deciding it yourself.
 
 ---
 
-## Current state — Sprint 0
+## Current state — Sprint 1
 
-Goal: environment setup and scaffolding, ending with one successful Python call
-to a local model through Ollama.
+Sprint 0 closed. Environment works, GPU discovery confirmed at `library=CUDA`.
+`qwen3.5:9b`, `phi4-mini`, `nomic-embed-text` all present locally. Full Sprint 0
+measurements live in `notes/sprint-0.md`.
 
-Done:
-- NVIDIA driver updated 555.97 → 610.88, fixing total Ollama GPU discovery failure
-- Ollama confirmed at `library=CUDA`, 7.6GB available
-- `qwen3.5:9b` and `nomic-embed-text` present locally
-- VRAM ceiling measured (see Hardware above)
+Goal: hand-build the plan/act/observe/critique state machine in plain Python,
+checkpointed to SQLite after every transition, resumable after a crash.
 
-Remaining:
-- Pull `phi4-mini`
-- Project scaffold + venv + `ollama` and `pyyaml` installed
-- `config/targets.yaml`
-- `scripts/smoke_test.py` — chat reply with latency and token count, embedding
-  vector length printed, both model tags read from config
-- Notes: `ollama ps` output, measured model swap time, whether Qwen and nomic
-  can co-reside
+Deliberately NOT in this sprint: LangGraph, real MCP servers, sqlite-vec,
+Browser Use, APScheduler, the `facts` and `approvals` tables.
 
-The embedding vector length matters beyond Sprint 0 — it fixes the sqlite-vec
-column width in Sprint 2.
+Tables created this sprint (migration 001): `schema_migrations`, `runs`, `tasks`,
+`checkpoints`, `llm_calls`. WAL mode on. Sprint 2 adds `facts` and `approvals`
+as migration 002.
+
+### Open — resolve before or during the build
+
+- **Does `think=False` degrade planning quality?** Verified only on a
+  one-sentence prompt. Untested on planner-shaped prompts (goal + tool schemas
+  -> task list) and critic-shaped prompts (action + result -> verdict). Do not
+  assume `think=False` is safe for all roles until probed. If it does degrade,
+  the fallback is a `reasoning` field inside the `format=` schema — bounded,
+  loggable, and Sprint 6 wants that logged anyway.
+- **KV cache quantization untested.** Try `OLLAMA_KV_CACHE_TYPE=q8_0` first
+  (halves the cache, negligible quality loss). ~0.7GB saved should close the
+  ~0.55GB gap and get 100% GPU residency. `q4_0` only if q8_0 isn't enough; it
+  has measurable quality cost. Requires `OLLAMA_FLASH_ATTENTION=1`. Verify it
+  actually applied via the `KV self size` log line — Ollama silently falls back
+  to f16 on unsupported architectures, no error.
+- **tok/s instability.** The 3.9 tok/s collapse was VRAM pressure forcing a
+  heavier offload mid-session. `think=False` shrinks the blast radius but does
+  not fix it. Full GPU residency should.
