@@ -13,9 +13,27 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from argus.storage import db  # noqa: E402
-from argus.storage.migrate import apply_migrations  # noqa: E402
+from argus.storage.migrate import MIGRATIONS_DIR, apply_migrations  # noqa: E402
 
 EXPECTED_TABLES = {"schema_migrations", "runs", "tasks", "checkpoints", "llm_calls"}
+EXPECTED_MIGRATIONS = ["001_initial.sql", "001b_task_columns.sql"]
+
+
+def task_columns(db_path: Path) -> list:
+    with db.connect(db_path) as conn:
+        return [row["name"] for row in conn.execute("PRAGMA table_info(tasks)")]
+
+
+def apply_only(db_path: Path, filename: str) -> None:
+    """Build a database that has run exactly one migration.
+
+    Deliberately does not reuse migrate.py's statement splitter, so the upgrade
+    test's starting state is independent of the code under test.
+    """
+    sql = (MIGRATIONS_DIR / filename).read_text(encoding="utf-8")
+    with db.connect(db_path) as conn:
+        conn.executescript(sql)
+        conn.execute("INSERT INTO schema_migrations (filename) VALUES (?)", (filename,))
 
 
 class Boom(Exception):
@@ -63,8 +81,13 @@ class TestMigrations(StorageTestCase):
     def test_fresh_db_gets_all_five_tables(self) -> None:
         applied = apply_migrations(self.db_path)
 
-        self.assertEqual(applied, ["001_initial.sql"])
+        self.assertEqual(applied, EXPECTED_MIGRATIONS)
         self.assertTrue(EXPECTED_TABLES.issubset(table_names(self.db_path)))
+
+    def test_migrations_apply_in_filename_order(self) -> None:
+        """001b must sort after 001 and before any future 002."""
+        found = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
+        self.assertEqual(found, EXPECTED_MIGRATIONS)
 
     def test_wal_mode_is_on(self) -> None:
         apply_migrations(self.db_path)
@@ -75,7 +98,52 @@ class TestMigrations(StorageTestCase):
     def test_rerunning_applies_nothing(self) -> None:
         apply_migrations(self.db_path)
         self.assertEqual(apply_migrations(self.db_path), [])
-        self.assertEqual(count(self.db_path, "schema_migrations"), 1)
+        self.assertEqual(count(self.db_path, "schema_migrations"), len(EXPECTED_MIGRATIONS))
+
+
+class TestIdempotencyKeyColumn(StorageTestCase):
+    def test_fresh_db_has_idempotency_key(self) -> None:
+        apply_migrations(self.db_path)
+        self.assertIn("idempotency_key", task_columns(self.db_path))
+
+    def test_upgrade_from_001_only_adds_the_column(self) -> None:
+        """The path that can break silently: a database that already ran 001.
+
+        Amending 001 in place would leave this database untouched, because
+        migrate.py skips by filename. 001b is what makes the upgrade happen.
+        """
+        apply_only(self.db_path, "001_initial.sql")
+        self.assertNotIn("idempotency_key", task_columns(self.db_path))
+
+        with db.transaction(self.db_path) as conn:
+            insert_run_task_checkpoint(conn)
+
+        self.assertEqual(apply_migrations(self.db_path), ["001b_task_columns.sql"])
+        self.assertIn("idempotency_key", task_columns(self.db_path))
+
+        # Pre-existing rows survive the upgrade and default to NULL.
+        with db.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT task_id, idempotency_key FROM tasks WHERE task_id = ?",
+                ("task-1",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["idempotency_key"])
+
+    def test_key_round_trips(self) -> None:
+        apply_migrations(self.db_path)
+        with db.transaction(self.db_path) as conn:
+            insert_run_task_checkpoint(conn)
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE task_id = ?",
+                ("run-1:task-1:act:0", "task-1"),
+            )
+
+        with db.connect(self.db_path) as conn:
+            key = conn.execute(
+                "SELECT idempotency_key FROM tasks WHERE task_id = ?", ("task-1",)
+            ).fetchone()["idempotency_key"]
+        self.assertEqual(key, "run-1:task-1:act:0")
 
 
 class TestTransactions(StorageTestCase):
