@@ -21,6 +21,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_target_started
     ON runs (target_id, started_at DESC);
 
 -- Sub-tasks the planner generated within a run.
+-- No idempotency_key here, deliberately: the key belongs to an external action,
+-- not a task, and Sprint 1 tasks have no side effects. It lands on `approvals`
+-- in Sprint 5 (migration 002+). Settled — do not re-add it to tasks.
 CREATE TABLE IF NOT EXISTS tasks (
     task_id      TEXT PRIMARY KEY,
     run_id       TEXT NOT NULL REFERENCES runs (run_id),
