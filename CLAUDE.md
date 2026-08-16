@@ -34,6 +34,8 @@ exception is intended.
 - Windows 11, PowerShell 7.6
 - Python 3.11.9
 - NVIDIA driver 610.88, CUDA 13.3
+- Ollama CLI 0.24.0, `ollama` Python package 0.6.2 — different numbers, don't
+  conflate them
 
 **Measured, not assumed.** `qwen3.5:9b` at Q4_K_M needs ~8.2GB total (4.0GB GPU
 weights + 2.2GB output layer + 1.4GB KV cache + 0.55GB compute graph) against a
@@ -217,12 +219,15 @@ as migration 002.
   assume `think=False` is safe for all roles until probed. If it does degrade,
   the fallback is a `reasoning` field inside the `format=` schema — bounded,
   loggable, and Sprint 6 wants that logged anyway.
-- **KV cache quantization untested.** Try `OLLAMA_KV_CACHE_TYPE=q8_0` first
-  (halves the cache, negligible quality loss). ~0.7GB saved should close the
-  ~0.55GB gap and get 100% GPU residency. `q4_0` only if q8_0 isn't enough; it
-  has measurable quality cost. Requires `OLLAMA_FLASH_ATTENTION=1`. Verify it
-  actually applied via the `KV self size` log line — Ollama silently falls back
-  to f16 on unsupported architectures, no error.
+- **KV cache quantization — tested, closed.** `OLLAMA_KV_CACHE_TYPE=q8_0` with
+  `OLLAMA_FLASH_ATTENTION=1` applies correctly (confirmed via `KvCacheType:q8_0`
+  in the load request and `kv cache device=CUDA0 size="1.3 GiB"` in the server
+  log, down from 1.4GB at f16). Total memory only dropped 8.2GB -> 8.1GB — still
+  over the 7.6GB ceiling, still 32/33 layers on GPU. The 2.2GB output layer on
+  CPU is the real bottleneck, untouched by KV cache size. q4_0 not worth trying:
+  even its full theoretical saving wouldn't close a 0.6GB gap, and it costs
+  measurable quality versus q8_0's near-zero cost. Keeping q8_0 as a free,
+  harmless setting — not revisiting this lever again.
 - **tok/s instability.** The 3.9 tok/s collapse was VRAM pressure forcing a
   heavier offload mid-session. `think=False` shrinks the blast radius but does
   not fix it. Full GPU residency should.
