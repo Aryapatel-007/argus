@@ -303,6 +303,20 @@ def _on_persist(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     # an already-completed task from done back to failed.
     ctx.current_task = None
 
+    # SINGLE-SHOT PLANNER, not true ReAct — confirmed empirically (see
+    # notes/sprint-1.md): a stub planner returning done=True on a hypothetical
+    # second call was never invoked a second time. This is why: PERSIST -> PLAN
+    # only fires when task_queue is non-empty (the condition below), and PLAN's
+    # "queue is empty, ask the planner" branch only fires when it's empty.
+    # Those two conditions are mutually exclusive, so a second planner call is
+    # structurally unreachable. Sprint 1 is plan-and-execute, not interleaved
+    # reasoning and acting.
+    #
+    # Deliberate for Sprint 1: the stub tools produce nothing worth re-planning
+    # against. Revisit in Sprint 4, when real tool failures need an adaptive
+    # response — changing this means routing on something other than
+    # local-queue-length (e.g. an explicit "replan" signal from CRITIQUE/OBSERVE
+    # instead of queue emptiness deciding PLAN vs DONE).
     if ctx.task_queue:
         return State.PLAN, ops
     return State.DONE, ops
