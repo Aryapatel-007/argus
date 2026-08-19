@@ -6,6 +6,7 @@ Run: python -m unittest discover -s tests -v
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import tempfile
 import unittest
@@ -16,11 +17,88 @@ from unittest import mock
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from argus.orchestrator import fake_llm, loop  # noqa: E402
+from argus import config  # noqa: E402
+from argus.orchestrator import fake_llm, llm, loop  # noqa: E402
 from argus.orchestrator.context import RunContext  # noqa: E402
 from argus.orchestrator.state import State  # noqa: E402
 from argus.storage import db  # noqa: E402
 from argus.storage.migrate import apply_migrations  # noqa: E402
+
+
+class FakeChatResponse:
+    """Shaped like ollama's ChatResponse: message.content plus timing fields."""
+
+    class _Message:
+        def __init__(self, content: str) -> None:
+            self.content = content
+            self.thinking = None
+
+    def __init__(self, content: str, eval_count: int = 120) -> None:
+        self.message = self._Message(content)
+        self.prompt_eval_count = 350
+        self.eval_count = eval_count
+        self.eval_duration = 5_000_000_000  # 5s -> 24 tok/s at eval_count=120
+        self.total_duration = 5_200_000_000
+        self.load_duration = 120_000_000
+        self.done = True
+        self.done_reason = "stop"
+
+
+class MockOllama:
+    """Stands in for llm._invoke, the single seam over the network.
+
+    Reproduces what the old fakes produced so the existing assertions still
+    mean the same thing: a 2-task plan, and a critic that fails twice per task
+    then passes. The critic counter is per-call rather than derived from the
+    prompt, because critic.md deliberately withholds run history — the prompt
+    is byte-identical across retries of the same action, so there is nothing in
+    it to count.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list = []
+        self._critic_calls = 0
+
+    def __call__(self, model_tag, messages, schema):
+        prompt = messages[0]["content"]
+        self.calls.append({"model_tag": model_tag, "messages": messages, "schema": schema})
+
+        if "You are the planner" in prompt:
+            return FakeChatResponse(
+                json.dumps(
+                    {
+                        "thought": "fetch the page, then confirm it parsed",
+                        "done": False,
+                        "tasks": [
+                            {
+                                "tool_name": "stub_fetch_ok",
+                                "args": {"url": "https://example.invalid/a"},
+                                "externally_visible": False,
+                            },
+                            {
+                                "tool_name": "stub_fetch_ok",
+                                "args": {"url": "https://example.invalid/b"},
+                                "externally_visible": False,
+                            },
+                        ],
+                    }
+                )
+            )
+
+        if "You are the critic" in prompt:
+            self._critic_calls += 1
+            passes = self._critic_calls % (fake_llm.CRITIQUE_FAILURES_PER_TASK + 1) == 0
+            return FakeChatResponse(
+                json.dumps(
+                    {
+                        "verdict": "pass" if passes else "fail",
+                        "confidence": 0.9 if passes else 0.4,
+                        "reflection": "" if passes else "narrow the extraction and retry",
+                    }
+                )
+            )
+
+        raise AssertionError(f"unexpected prompt sent to Ollama:\n{prompt[:200]}")
 
 
 def checkpoint_rows(db_path: Path, run_id: str) -> List[Any]:
@@ -45,7 +123,7 @@ def task_rows(db_path: Path, run_id: str) -> List[Any]:
         ).fetchall()
 
 
-def oversized_batch_planner(ctx: RunContext) -> Dict[str, Any]:
+def oversized_batch_planner(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     """A planner that asks for more tasks than MAX_TASKS_PER_RUN in ONE call.
 
     Under the literal transition table, the planner is SINGLE-SHOT per run:
@@ -82,7 +160,7 @@ def oversized_batch_planner(ctx: RunContext) -> Dict[str, Any]:
     }
 
 
-def externally_visible_planner(ctx: RunContext) -> Dict[str, Any]:
+def externally_visible_planner(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     """One task whose action leaves the machine — the Sprint 5 gate branch."""
     if ctx.facts_staged or ctx.current_task is not None:
         return {"done": True, "parse_ok": True, "tasks": []}
@@ -109,6 +187,13 @@ class LoopTestCase(unittest.TestCase):
         self.db_path = Path(self._tmp.name) / "test_argus.db"
         self.addCleanup(self._tmp.cleanup)
         apply_migrations(self.db_path)
+
+        # Patch the ONE network seam. Everything above it — prompt rendering,
+        # schema validation, llm_calls logging, the adapters — runs for real.
+        self.ollama = MockOllama()
+        patcher = mock.patch.object(llm, "_invoke", self.ollama)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class TestContextRoundTrip(unittest.TestCase):
@@ -330,6 +415,66 @@ class TestResume(LoopTestCase):
         resumed = loop.load_latest_checkpoint(run_id, db_path=self.db_path)
 
         self.assertEqual(resumed, ctx)
+
+
+class TestLLMWiring(LoopTestCase):
+    """The loop really goes through llm.py, not the old fakes."""
+
+    def test_full_run_logs_planner_and_critic_calls(self) -> None:
+        ctx = loop.new_run("monash_ai_masters")
+        loop.run_to_completion(ctx, db_path=self.db_path)
+        self.assertIs(ctx.state, State.DONE)
+
+        with db.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT role, model_tag, think_mode, prompt_file, ok, timed_out, "
+                "tok_s, task_id, step_index FROM llm_calls WHERE run_id = ? "
+                "ORDER BY rowid",
+                (ctx.run_id,),
+            ).fetchall()
+
+        roles = [r["role"] for r in rows]
+        # Planner is single-shot; critic runs once per attempt, 3 per task.
+        self.assertEqual(roles.count("planner"), 1)
+        self.assertEqual(roles.count("critic"), 6)
+
+        for row in rows:
+            self.assertEqual(row["think_mode"], "False")
+            self.assertEqual(row["ok"], 1)
+            self.assertEqual(row["timed_out"], 0)
+            self.assertEqual(row["model_tag"], config.model_for_role(row["role"]))
+            self.assertAlmostEqual(row["tok_s"], 24.0)
+            self.assertIsNotNone(row["step_index"])
+
+        # The planner runs before any task exists, so its row has no task_id.
+        self.assertIsNone(rows[0]["task_id"])
+        self.assertEqual(rows[0]["role"], "planner")
+
+    def test_act_runs_the_real_stub_tools(self) -> None:
+        ctx = loop.new_run("monash_ai_masters")
+        loop.run_to_completion(ctx, db_path=self.db_path)
+
+        # The planner asked for stub_fetch_ok, so the staged fact carries that
+        # tool's real content rather than a canned observation string.
+        self.assertIn("intake dates", ctx.facts_staged[0]["summary"])
+
+    def test_failing_and_empty_tools_come_back_as_observations(self) -> None:
+        """ACT -> OBSERVE is unconditional: neither a raising tool nor an empty
+        result may escape as an exception.
+        """
+        from argus.orchestrator import tools
+
+        failed = tools.run_tool("stub_fetch_fails", {})
+        self.assertFalse(failed["ok"])
+        self.assertIn("503", failed["error"])
+
+        empty = tools.run_tool("stub_fetch_empty", {})
+        self.assertTrue(empty["ok"])
+        self.assertEqual(empty["content"], "")
+
+        unknown = tools.run_tool("no_such_tool", {})
+        self.assertFalse(unknown["ok"])
+        self.assertIn("unknown tool", unknown["error"])
 
 
 class TestCircuitBreaker(LoopTestCase):

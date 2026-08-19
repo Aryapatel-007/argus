@@ -22,7 +22,7 @@ from argus.orchestrator.context import RunContext
 CRITIQUE_FAILURES_PER_TASK = 2
 
 
-def fake_plan(ctx: RunContext) -> Dict[str, Any]:
+def fake_plan(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     """Return the initial task list, or done once the queue is exhausted.
 
     Only called when the queue is empty: PERSIST routes back to PLAN solely
@@ -58,8 +58,8 @@ def fake_plan(ctx: RunContext) -> Dict[str, Any]:
     }
 
 
-def fake_act(ctx: RunContext) -> Dict[str, Any]:
-    """Pretend to invoke the tool named by the current action."""
+def fake_act(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
+    """Record which tool is about to run. The call itself happens at OBSERVE."""
     action = ctx.last_action or {}
     return {
         "tool": action.get("tool"),
@@ -68,17 +68,20 @@ def fake_act(ctx: RunContext) -> Dict[str, Any]:
     }
 
 
-def fake_observe(ctx: RunContext) -> Dict[str, Any]:
-    """Observe the result. A tool error is an observation, never an exception."""
+def fake_observe(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
+    """Run the named stub tool and return its observation.
+
+    Not actually fake any more — it dispatches to the real stub tools in
+    tools.py. Kept in this module so ACT/OBSERVE stay one injection point.
+    A tool error comes back as an observation, never as an exception.
+    """
+    from argus.orchestrator import tools
+
     action = ctx.last_action or {}
-    return {
-        "ok": True,
-        "tool": action.get("tool"),
-        "content": f"stub result for {action.get('tool')} attempt {ctx.attempt_count}",
-    }
+    return tools.run_tool(action.get("tool"), action.get("args", {}))
 
 
-def fake_critique(ctx: RunContext) -> Dict[str, Any]:
+def fake_critique(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     """Fail the first CRITIQUE_FAILURES_PER_TASK attempts, then pass.
 
     Derived from ctx.attempt_count (which resets per task and is checkpointed)
@@ -96,7 +99,7 @@ def fake_critique(ctx: RunContext) -> Dict[str, Any]:
     return {"verdict": "pass", "reflection": None}
 
 
-def fake_write(ctx: RunContext) -> Dict[str, Any]:
+def fake_write(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     """Shape a fact to stage at PERSIST."""
     task = ctx.current_task or {}
     observation = ctx.last_observation or {}

@@ -43,7 +43,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from argus.orchestrator import fake_llm
+from argus.orchestrator import fake_llm, llm, tools
 from argus.orchestrator.context import RunContext, utcnow_iso
 from argus.orchestrator.state import (
     TASK_STATUS_DONE,
@@ -90,13 +90,23 @@ DbOp = Tuple[str, Tuple[Any, ...]]
 
 @dataclass
 class Stubs:
-    """Injection point for the model-backed calls. Sprint 1 uses the fakes."""
+    """Injection point for the model-backed calls.
 
-    plan: Callable[[RunContext], Dict[str, Any]] = fake_llm.fake_plan
-    act: Callable[[RunContext], Dict[str, Any]] = fake_llm.fake_act
-    observe: Callable[[RunContext], Dict[str, Any]] = fake_llm.fake_observe
-    critique: Callable[[RunContext], Dict[str, Any]] = fake_llm.fake_critique
-    write: Callable[[RunContext], Dict[str, Any]] = fake_llm.fake_write
+    plan and critique are now REAL Ollama calls. write stays stubbed — the
+    writer is not needed to answer this sprint's open question (whether
+    think=False degrades planning and critique specifically), and its `facts`
+    table does not exist until Sprint 2.
+
+    Each callable takes (ctx, conn). The connection is threaded through so
+    llm.py can write its llm_calls row for a call that has already happened,
+    even if the step that made it goes on to fail.
+    """
+
+    plan: Callable[[RunContext, Any], Dict[str, Any]] = llm.real_plan
+    act: Callable[[RunContext, Any], Dict[str, Any]] = fake_llm.fake_act
+    observe: Callable[[RunContext, Any], Dict[str, Any]] = fake_llm.fake_observe
+    critique: Callable[[RunContext, Any], Dict[str, Any]] = llm.real_critique
+    write: Callable[[RunContext, Any], Dict[str, Any]] = fake_llm.fake_write
 
 
 DEFAULT_STUBS = Stubs()
@@ -143,7 +153,7 @@ def _terminate_task(
 # ---------------------------------------------------------------------------
 
 
-def _on_init(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _on_init(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     ops: List[DbOp] = [
         (
             "INSERT INTO runs (run_id, target_id, status, started_at) VALUES (?, ?, ?, ?)",
@@ -153,14 +163,16 @@ def _on_init(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     return State.PLAN, ops
 
 
-def _on_plan(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _on_plan(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     ops: List[DbOp] = []
 
     if not ctx.task_queue:
-        result = stubs.plan(ctx)
+        result = stubs.plan(ctx, conn)
 
         if not result.get("parse_ok", True):
-            ctx.parse_retries += 1
+            # parse_retries is incremented by llm.call_ollama, the layer that
+            # knows a call actually failed. The loop only checks the guard —
+            # incrementing here too would double-count and fail a run early.
             if ctx.parse_retries >= MAX_PARSE_RETRIES:
                 ctx.reflections.append("planner output unparseable, giving up")
                 return State.FAILED, _terminate_task(
@@ -235,9 +247,9 @@ def _on_plan(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     return State.ACT, ops
 
 
-def _on_act(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _on_act(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     ctx.attempt_count += 1
-    ctx.last_action = {**(ctx.last_action or {}), **stubs.act(ctx)}
+    ctx.last_action = {**(ctx.last_action or {}), **stubs.act(ctx, conn)}
 
     ops: List[DbOp] = []
     if ctx.current_task is not None:
@@ -251,14 +263,14 @@ def _on_act(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     return State.OBSERVE, ops
 
 
-def _on_observe(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _on_observe(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     # A tool error is an observation, not an exception: OBSERVE always advances.
-    ctx.last_observation = stubs.observe(ctx)
+    ctx.last_observation = stubs.observe(ctx, conn)
     return State.CRITIQUE, []
 
 
-def _on_critique(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
-    verdict = stubs.critique(ctx)
+def _on_critique(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
+    verdict = stubs.critique(ctx, conn)
 
     if verdict.get("verdict") == "pass":
         return State.GATE, []
@@ -276,7 +288,7 @@ def _on_critique(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     )
 
 
-def _on_gate(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _on_gate(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     action = ctx.last_action or {}
     if action.get("externally_visible"):
         # Sprint 5 replaces this with AWAIT_APPROVAL + a row in `approvals`.
@@ -294,8 +306,8 @@ def _on_gate(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
     return State.PERSIST, []
 
 
-def _on_persist(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
-    ctx.facts_staged.append(stubs.write(ctx))
+def _on_persist(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
+    ctx.facts_staged.append(stubs.write(ctx, conn))
     ops = _terminate_task(ctx, TASK_STATUS_DONE)
 
     # Cleared on BOTH branches: after PERSIST no task is in flight. Leaving it
@@ -333,11 +345,11 @@ _HANDLERS = {
 }
 
 
-def _dispatch(ctx: RunContext, stubs: Stubs) -> Tuple[State, List[DbOp]]:
+def _dispatch(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     handler = _HANDLERS.get(ctx.state)
     if handler is None:
         raise ValueError(f"no handler for state {ctx.state!r}")
-    return handler(ctx, stubs)
+    return handler(ctx, stubs, conn)
 
 
 # ---------------------------------------------------------------------------
@@ -364,33 +376,40 @@ def step(
     entry_index = ctx.step_index
     task_before = ctx.current_task["task_id"] if ctx.current_task else None
 
-    if entry_index >= MAX_STEPS:
-        # BACKSTOP only — MAX_TASKS_PER_RUN in _on_plan is meant to catch a
-        # runaway planner first. Reaching here means something unanticipated
-        # is happening. Fires AT MAX_STEPS, so MAX_STEPS work steps (indices
-        # 0..MAX_STEPS-1) actually happen and this terminal row lands at index
-        # MAX_STEPS: the FAILED checkpoint records why the run stopped, it is
-        # not itself a unit of work.
-        ctx.reflections.append(
-            f"step backstop: reached {MAX_STEPS} steps without tripping "
-            f"MAX_TASKS_PER_RUN={MAX_TASKS_PER_RUN}, forcing FAILED"
-        )
-        next_state, ops = State.FAILED, _terminate_task(
-            ctx, TASK_STATUS_FAILED, f"step backstop at {MAX_STEPS} steps"
-        )
-    else:
-        next_state, ops = _dispatch(ctx, stubs)
-
-    ctx.state = next_state
-    ctx.step_index = entry_index + 1
-    ctx.updated_at = utcnow_iso()
-
-    # Fall back to the task the step started on, so the PERSIST checkpoint still
-    # names the task it finished rather than losing it to the clear above.
-    task_after = ctx.current_task["task_id"] if ctx.current_task else None
-    task_id = task_after or task_before
-
+    # The connection is opened BEFORE dispatch, not after, because dispatch is
+    # where the Ollama calls happen and llm.py logs each one to llm_calls on
+    # this connection. Those writes land in autocommit, outside the db.atomic()
+    # block below, so a call that really happened stays recorded even if this
+    # step's transaction subsequently rolls back. llm_calls is an observability
+    # log, not run state — losing the record of a 120s timeout would be worse
+    # than the row briefly outliving a step that never completed.
     with _conn_for(conn, db_path) as active:
+        if entry_index >= MAX_STEPS:
+            # BACKSTOP only — MAX_TASKS_PER_RUN in _on_plan is meant to catch a
+            # runaway planner first. Reaching here means something unanticipated
+            # is happening. Fires AT MAX_STEPS, so MAX_STEPS work steps (indices
+            # 0..MAX_STEPS-1) actually happen and this terminal row lands at
+            # index MAX_STEPS: the FAILED checkpoint records why the run
+            # stopped, it is not itself a unit of work.
+            ctx.reflections.append(
+                f"step backstop: reached {MAX_STEPS} steps without tripping "
+                f"MAX_TASKS_PER_RUN={MAX_TASKS_PER_RUN}, forcing FAILED"
+            )
+            next_state, ops = State.FAILED, _terminate_task(
+                ctx, TASK_STATUS_FAILED, f"step backstop at {MAX_STEPS} steps"
+            )
+        else:
+            next_state, ops = _dispatch(ctx, stubs, active)
+
+        ctx.state = next_state
+        ctx.step_index = entry_index + 1
+        ctx.updated_at = utcnow_iso()
+
+        # Fall back to the task the step started on, so the PERSIST checkpoint
+        # still names the task it finished rather than losing it to the clear.
+        task_after = ctx.current_task["task_id"] if ctx.current_task else None
+        task_id = task_after or task_before
+
         with db.atomic(active):
             for sql, params in ops:
                 active.execute(sql, params)

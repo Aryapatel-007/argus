@@ -213,12 +213,9 @@ as migration 002.
 
 ### Open — resolve before or during the build
 
-- **Does `think=False` degrade planning quality?** Verified only on a
-  one-sentence prompt. Untested on planner-shaped prompts (goal + tool schemas
-  -> task list) and critic-shaped prompts (action + result -> verdict). Do not
-  assume `think=False` is safe for all roles until probed. If it does degrade,
-  the fallback is a `reasoning` field inside the `format=` schema — bounded,
-  loggable, and Sprint 6 wants that logged anyway.
+- **`think=False` planning quality — tested, closed.** Confirmed against real
+  planner-shaped prompts: does not degrade quality. See
+  `notes/sprint-1.md` for the run data.
 - **KV cache quantization — tested, closed.** `OLLAMA_KV_CACHE_TYPE=q8_0` with
   `OLLAMA_FLASH_ATTENTION=1` applies correctly (confirmed via `KvCacheType:q8_0`
   in the load request and `kv cache device=CUDA0 size="1.3 GiB"` in the server
@@ -228,6 +225,6 @@ as migration 002.
   even its full theoretical saving wouldn't close a 0.6GB gap, and it costs
   measurable quality versus q8_0's near-zero cost. Keeping q8_0 as a free,
   harmless setting — not revisiting this lever again.
-- **tok/s instability.** The 3.9 tok/s collapse was VRAM pressure forcing a
-  heavier offload mid-session. `think=False` shrinks the blast radius but does
-  not fix it. Full GPU residency should.
+- **tok/s instability — tested, closed.** Real orchestrator runs held 12.3-23.6
+  tok/s throughout; the 3.9 tok/s collapse did not recur under this workload.
+  See `notes/sprint-1.md`.
