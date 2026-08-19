@@ -213,18 +213,5 @@ as migration 002.
 
 ### Open — resolve before or during the build
 
-- **`think=False` planning quality — tested, closed.** Confirmed against real
-  planner-shaped prompts: does not degrade quality. See
-  `notes/sprint-1.md` for the run data.
-- **KV cache quantization — tested, closed.** `OLLAMA_KV_CACHE_TYPE=q8_0` with
-  `OLLAMA_FLASH_ATTENTION=1` applies correctly (confirmed via `KvCacheType:q8_0`
-  in the load request and `kv cache device=CUDA0 size="1.3 GiB"` in the server
-  log, down from 1.4GB at f16). Total memory only dropped 8.2GB -> 8.1GB — still
-  over the 7.6GB ceiling, still 32/33 layers on GPU. The 2.2GB output layer on
-  CPU is the real bottleneck, untouched by KV cache size. q4_0 not worth trying:
-  even its full theoretical saving wouldn't close a 0.6GB gap, and it costs
-  measurable quality versus q8_0's near-zero cost. Keeping q8_0 as a free,
-  harmless setting — not revisiting this lever again.
-- **tok/s instability — tested, closed.** Real orchestrator runs held 12.3-23.6
-  tok/s throughout; the 3.9 tok/s collapse did not recur under this workload.
-  See `notes/sprint-1.md`.
+Nothing open. Sprint 1's three items were all closed — see
+`notes/sprint-1.md`.

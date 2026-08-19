@@ -66,3 +66,23 @@ recur under this workload. No instability observed.
 only, with `tasks.items` as a `$ref` into `$defs`. Flattening `Action` inline
 remains available if grammar-constrained decoding proves weak later. Not
 needed this sprint — the prompt fix alone resolved it.
+
+## Closed from CLAUDE.md's Sprint 1 open-items list
+
+Moved out of CLAUDE.md once resolved, so the file prepended to every turn
+doesn't keep paying a token cost for history nobody needs. Full detail here
+instead.
+
+### KV cache quantization — tested, closed
+
+`OLLAMA_KV_CACHE_TYPE=q8_0` with `OLLAMA_FLASH_ATTENTION=1` applies correctly
+(confirmed via `KvCacheType:q8_0` in the load request and
+`kv cache device=CUDA0 size="1.3 GiB"` in the server log, down from 1.4GB at
+f16). Total memory only dropped 8.2GB -> 8.1GB — still over the 7.6GB
+ceiling, still 32/33 layers on GPU. The 2.2GB output layer on CPU is the real
+bottleneck, untouched by KV cache size.
+
+`q4_0` not worth trying: even its full theoretical saving wouldn't close the
+remaining 0.6GB gap, and it costs measurable quality versus q8_0's near-zero
+cost. Keeping q8_0 as a free, harmless setting — not revisiting this lever
+again.
