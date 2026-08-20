@@ -204,6 +204,11 @@ measurements live in `notes/sprint-0.md`.
 Goal: hand-build the plan/act/observe/critique state machine in plain Python,
 checkpointed to SQLite after every transition, resumable after a crash.
 
+Crash-resume proven against real Ollama (`scripts/crash_test.py`) for both
+LLM-call-in-flight scenarios. Between-steps mode covered by unit tests
+instead — the real window is narrower than a separate process can reliably
+target.
+
 Deliberately NOT in this sprint: LangGraph, real MCP servers, sqlite-vec,
 Browser Use, APScheduler, the `facts` and `approvals` tables.
 

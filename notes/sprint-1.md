@@ -86,3 +86,61 @@ bottleneck, untouched by KV cache size.
 remaining 0.6GB gap, and it costs measurable quality versus q8_0's near-zero
 cost. Keeping q8_0 as a free, harmless setting — not revisiting this lever
 again.
+
+## Crash-resume — verified against real Ollama
+
+`scripts/crash_test.py` kills a real OS process mid-run against a real Ollama
+call, then resumes it, and compares the result to an uninterrupted control
+run. Three scenarios:
+
+### kill-during-planner-call — PASS
+
+On target. 24/24 checks. Mid-LLM-call confirmed via `llm_calls`-row polling
+(the row is written only after a call returns, so an unmoved count means the
+call is still in flight). Ungracefully killed, proven three ways: `poll()` was
+`None` immediately before the kill, the subprocess returncode matched a hard
+kill, and the last checkpoint before the kill was non-terminal. Resumed to
+DONE. `facts_staged` content matched the control run byte-for-byte (task_id
+excepted — see harness bug #1 below).
+
+### kill-during-critic-call — PASS
+
+On target. 24/24 checks. Same guarantees as above.
+
+### kill-between-steps — INCONCLUSIVE
+
+Could not land the window in 5 attempts. Measured on this machine: non-LLM
+step gaps ~1ms, the open-transaction window (`llm_calls` row committed ->
+checkpoint committed) ~0-6ms, against ~13s of model-call time per run. The
+window is narrower than the kill latency achievable from a separate process.
+
+Not a gap in the guarantee. This mode — a crash during a local SQL write
+inside `db.atomic()` — is already proven by two committed tests:
+`test_storage.py`'s `test_failure_mid_transaction_writes_nothing` (during
+development, verified not vacuous via a one-off negative control: a
+deliberately broken `atomic()` that COMMITs on exception instead of rolling
+back was shown to fail this test), and `test_loop.py`'s simulated
+mid-transaction crash tests (`raise` inside a `with db.transaction` block).
+The real-process harness confirms the harder case, a crash mid external call;
+the easier case was already proven by a method suited to it — you cannot
+reliably OS-kill a process inside a 1ms window, but you can trivially raise an
+exception at an exact line.
+
+### Two harness bugs found and fixed during this work
+
+1. **Equivalence check was unsatisfiable by construction.** It compared full
+   `facts_staged` dicts, including `task_id`, which embeds `run_id`
+   (`f"{run_id}:task-{n}"`). Two distinct runs always have different
+   `run_id`s, so no crash-resume behavior could ever make this pass — it
+   failed even when nothing was wrong. Fixed by normalizing each side's
+   `run_id` to a placeholder before comparing, so a fact attached to the wrong
+   task *ordinal* is still caught. Verified with two negative controls: a real
+   content difference and a task-ordinal mismatch both still produce a
+   failure after normalization.
+2. **Between-steps targeting polled too slowly for the window it was aiming
+   at.** A 50ms poll interval against a <10ms window meant the trigger
+   checkpoint was detected only after the process had already moved on into
+   the next model call. Fixed with a tight poll (0.2ms, persistent connection)
+   on the `llm_calls` row landing, plus 5 retries and an explicit
+   `INCONCLUSIVE` report on a miss rather than silently re-testing the
+   mid-LLM-call mode a third time.
