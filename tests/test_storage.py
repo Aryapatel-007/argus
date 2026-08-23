@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -300,6 +301,47 @@ class TestTransactions(StorageTestCase):
             ).fetchone()
         self.assertEqual(latest["step_index"], 0)
         self.assertEqual(latest["state"], "plan")
+
+    def test_broken_atomic_negative_control_lets_partial_writes_survive(self) -> None:
+        """Negative control for test_failure_mid_transaction_writes_nothing.
+
+        That test is the assertion Sprint 1's crash-recovery guarantee rests
+        on. This proves it isn't vacuous: swap in an `atomic()` that COMMITs on
+        exception instead of rolling back (deliberately broken, local to this
+        test, never exported), run the identical insert-then-raise sequence,
+        and confirm the rows DO survive. If `db.atomic()` were ever broken this
+        way for real, the real test would start passing for the wrong reason -
+        this test is what would notice.
+        """
+
+        @contextmanager
+        def broken_atomic(conn: sqlite3.Connection):
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("COMMIT")  # deliberately wrong: should ROLLBACK
+                raise
+            else:
+                conn.execute("COMMIT")
+
+        with self.assertRaises(Boom):
+            with db.connect(self.db_path) as conn:
+                with broken_atomic(conn):
+                    conn.execute(
+                        "INSERT INTO runs (run_id, target_id, status) VALUES (?, ?, ?)",
+                        ("run-crash", "monash_ai_masters", "running"),
+                    )
+                    conn.execute(
+                        "INSERT INTO tasks (task_id, run_id, task_index, description, status) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        ("task-crash", "run-crash", 0, "check intake dates", "pending"),
+                    )
+                    raise Boom("crash after the task insert, before the checkpoint")
+
+        self.assertEqual(count(self.db_path, "runs"), 1)
+        self.assertEqual(count(self.db_path, "tasks"), 1)
+        self.assertEqual(count(self.db_path, "checkpoints"), 0)
 
 
 class TestNoTransactionMarker(StorageTestCase):

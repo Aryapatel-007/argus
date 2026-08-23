@@ -740,7 +740,22 @@ SCENARIOS = [
 # ---------------------------------------------------------------------------
 
 
-def _seed(db_path: Path, run_id: str, states: List[str], gap: bool = False) -> None:
+def _seed(
+    db_path: Path,
+    run_id: str,
+    states: List[str],
+    gap: bool = False,
+    bad_final_payload: bool = False,
+) -> None:
+    """Seed a run's checkpoints directly, bypassing the real orchestrator.
+
+    `gap`: skip an index so `checkpoints.step_index` is non-contiguous.
+    `bad_final_payload`: keep `step_index` perfectly contiguous, but write the
+    LAST checkpoint's payload with a step_index one higher than it should be.
+    This isolates the "checkpoint count == completed steps only" check from
+    contiguity - a fixture that breaks both at once can't tell you which check
+    actually caught it.
+    """
     from argus.orchestrator.context import RunContext
 
     conn = _connect(db_path)
@@ -750,10 +765,15 @@ def _seed(db_path: Path, run_id: str, states: List[str], gap: bool = False) -> N
             "INSERT INTO runs (run_id, target_id, status) VALUES (?, ?, ?)",
             (run_id, "t", "running"),
         )
+        last_position = len(states) - 1
         for position, state in enumerate(states):
             index = position + 1 if gap and position >= 2 else position
+            payload_step_index = index + 1
+            if bad_final_payload and position == last_position:
+                payload_step_index += 1  # deliberately wrong; step_index column untouched
             ctx = RunContext(
-                run_id=run_id, target_id="t", goal="g", state=State(state), step_index=index + 1
+                run_id=run_id, target_id="t", goal="g", state=State(state),
+                step_index=payload_step_index,
             )
             conn.execute(
                 "INSERT INTO checkpoints "
@@ -790,6 +810,20 @@ def self_check(db_path: Path) -> int:
     if "step_index contiguous 0..N" not in caught:
         failures.append("a seeded step_index gap was NOT caught - checks are vacuous")
     print(f"  seeded gap              -> caught by: {caught}")
+
+    # Dedicated negative control for "checkpoint count == completed steps
+    # only", isolated from contiguity: step_index stays 0..N, only the final
+    # payload's step_index is wrong.
+    reset_db(db_path)
+    _seed(db_path, "run-badcount", ["PLAN", "ACT", "OBSERVE", "CRITIQUE"], bad_final_payload=True)
+    badcount = ScenarioResult("seeded-bad-payload-count")
+    assert_database_sane(badcount, db_path, "run-badcount")
+    caught_bc = [c.name for c in badcount.failed]
+    if "checkpoint count == completed steps only" not in caught_bc:
+        failures.append("a seeded payload/count mismatch was NOT caught - check is vacuous")
+    if "step_index contiguous 0..N" in caught_bc:
+        failures.append("bad-payload fixture also broke contiguity - not an isolated control")
+    print(f"  seeded bad payload count -> caught by: {caught_bc}")
 
     reset_db(db_path)
     _seed(db_path, "run-cls", ["PLAN"])

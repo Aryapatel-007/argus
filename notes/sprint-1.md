@@ -116,15 +116,18 @@ window is narrower than the kill latency achievable from a separate process.
 
 Not a gap in the guarantee. This mode — a crash during a local SQL write
 inside `db.atomic()` — is already proven by two committed tests:
-`test_storage.py`'s `test_failure_mid_transaction_writes_nothing` (during
-development, verified not vacuous via a one-off negative control: a
-deliberately broken `atomic()` that COMMITs on exception instead of rolling
-back was shown to fail this test), and `test_loop.py`'s simulated
-mid-transaction crash tests (`raise` inside a `with db.transaction` block).
-The real-process harness confirms the harder case, a crash mid external call;
-the easier case was already proven by a method suited to it — you cannot
-reliably OS-kill a process inside a 1ms window, but you can trivially raise an
-exception at an exact line.
+`test_storage.py`'s `test_failure_mid_transaction_writes_nothing`, paired with
+a committed negative control in the same file
+(`test_broken_atomic_negative_control_lets_partial_writes_survive`, in
+`TestTransactions`) that swaps in a deliberately broken `atomic()` which
+COMMITs on exception instead of rolling back, runs the identical
+insert-then-raise sequence, and asserts the rows survive — proving the real
+test isn't vacuous, as a standing check rather than a one-off script — and
+`test_loop.py`'s simulated mid-transaction crash tests (`raise` inside a
+`with db.transaction` block). The real-process harness confirms the harder
+case, a crash mid external call; the easier case was already proven by a
+method suited to it — you cannot reliably OS-kill a process inside a 1ms
+window, but you can trivially raise an exception at an exact line.
 
 ### Two harness bugs found and fixed during this work
 
@@ -144,3 +147,13 @@ exception at an exact line.
    on the `llm_calls` row landing, plus 5 retries and an explicit
    `INCONCLUSIVE` report on a miss rather than silently re-testing the
    mid-LLM-call mode a third time.
+3. **`self_check()`'s "checkpoint count == completed steps only" assertion had
+   no standing negative control of its own.** The only seeded fixture that
+   broke it was the step-index gap fixture, which also breaks contiguity at
+   the same time — `self_check()` asserted on the contiguity failure but never
+   asserted this check specifically fired, so it was caught only
+   incidentally. A future weakening of just this check could have gone
+   unnoticed. Fixed by adding `_seed(..., bad_final_payload=True)`, a fixture
+   that keeps `step_index` perfectly contiguous and corrupts only the final
+   checkpoint's payload count, isolating the check, plus an explicit assertion
+   that it fires and that contiguity does *not* also fire on this fixture.
