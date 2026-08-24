@@ -333,3 +333,15 @@ identical.
 ### Tests: 105 passing, 0 failing
 
 Up from 104. New: the import-graph isolation check.
+
+## Step 5: memory server skeleton + remember_fact
+
+`src/argus/servers/memory.py`, first tool: `remember_fact`.
+
+`RememberResult.change_kind`'s `"unchanged"` value is an **API-only outcome**
+with no corresponding row write — it means the existing current row's
+`last_seen_*` was touched and nothing else happened. `facts.change_kind`'s
+CHECK constrains the column to `('added', 'modified', 'removed')`; `'unchanged'`
+never appears there, by construction. **Sprint 4's diff logic needs to know
+this asymmetry exists**: querying `facts.change_kind` will never surface an
+`'unchanged'` row, because that outcome is defined as "no new row."
