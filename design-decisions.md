@@ -2,8 +2,47 @@
 
 Why, not what. Entries here are decisions made deliberately, with the
 reasoning that led to them, so a later sprint doesn't re-argue something
-already settled. See also CLAUDE.md's "Design decisions already made"
-section for the Sprint 0/1 decisions this file continues.
+already settled.
+
+## Sprint 0/1
+
+## Hand-built the orchestration loop before adopting LangGraph
+
+Chose to write the plan, act, critique state machine by hand in Sprint 1, rather than starting directly with LangGraph, even though I already knew LangGraph practically from a prior course. A framework hides exactly the hard parts worth understanding first: what a checkpointer actually solves, what happens when a step fails partway through, what idempotent retries protect against. Building it raw first means any later use of LangGraph is informed rather than cargo-culted. LangGraph remains an option to migrate to afterward, once the underlying mechanics are already understood firsthand.
+
+## Local models instead of a paid API
+
+Chose Ollama running local, quantized models (Qwen3.5-9B and Phi-4-mini) instead of calling a hosted API. This keeps the project at zero recurring cost, keeps all data on the machine rather than sent to a third party, and matches the actual hardware available (RTX 4060, 8GB VRAM). The tradeoff, accepted deliberately: local models are less reliable at structured output than frontier hosted models, which is exactly why deterministic validation and retry logic exist ahead of every judge or tool call.
+
+## Custom-built MCP servers instead of only consuming existing ones
+
+Chose to build the memory and browser tool servers from scratch using the official MCP Python SDK, rather than only wiring together pre-built third-party MCP servers. No ready-made MCP server does what this specific memory design (recency, importance, and relevance-weighted retrieval, tied to sqlite-vec) or this specific browsing job needs. Building them from scratch is also a deliberate skill investment, since almost nobody at a junior level has actually built an MCP server rather than only consumed one.
+
+## sqlite-vec instead of a heavier vector database
+
+Chose sqlite-vec, an embedded extension living inside the same SQLite file as everything else, over a separate vector database like Chroma. At single-developer scale, with a fact count that will realistically stay in the thousands, an embedded store needs no server process, no separate deployment, and no second system to keep in sync with the primary database. Chroma remains the better choice only once collections, metadata filtering at scale, or a genuinely large corpus are actually needed, none of which apply here.
+
+## Browser Use layered on top of Playwright, rather than hand-coded Playwright selectors alone
+
+Originally planned to hand-write Playwright automation directly, reusing prior internship experience. Reconsidered this once the actual failure mode became clear: hand-coded selectors are brittle against page layouts that vary across dozens of different, uncontrolled company websites, and that can silently change over time. Browser Use adds an LLM-driven layer that interprets a page rather than matching a fixed selector, while still running on Playwright underneath, so the original skill isn't wasted, only the approach of hand-coding every single target site is dropped. Raw Playwright remains available as a fallback for any one specific page worth hand-tuning.
+
+## Kept the 9B planner model even though it doesn't fit entirely in VRAM
+
+Sprint 0 measurement showed Qwen3.5-9B at Q4_K_M needs roughly 8.2GB in total against a usable ceiling of about 7.6GB, so it runs with one of its 33 layers held back on the CPU instead of fully offloaded to the GPU. The obvious response was to drop to a 4B-class model that fits cleanly. Chose not to. Measured throughput with the partial offload is 24.3 tok/s, which is comfortable for a system that wakes up on a weekly schedule rather than serving live chat. The slow first response that suggested a problem turned out to be one long generation, not slow inference: the model spent roughly 1200 tokens reasoning to produce a twenty-word answer. The real latency lever is therefore the thinking budget on routine calls, not the parameter count, and switching to a smaller model would have traded away planning quality to fix a problem it wasn't causing. Phi-4-mini stays in the architecture for the frequent cheap calls exactly as originally planned, which is the right job for a smaller model, rather than as a replacement for the planner.
+
+## Thinking is disabled on every call, and the planner stayed on the 9B model
+
+Qwen3.5 is a reasoning model, and Sprint 1's probe showed it spending 1228-1561 eval tokens and 67-83 seconds to produce a one-sentence answer. With `think=False` the same prompt returned 37 tokens in 2.1 seconds. Roughly 97.6% of generation was reasoning the system never used. Two things came out of that measurement. First, `think="low"` is not a middle gear on this model, it is silently coerced to on and returns byte-identical output to `think=True`, so thinking here is binary and the SDK's type hint is misleading. Second, and more important, one thinking-enabled run went runaway: 6163 tokens over 26 minutes, returning empty content, with throughput collapsing to 3.9 tok/s under a heavier CPU offload. With thinking on, generation length is unbounded and can terminate with no answer at all. A system that wakes on a weekly schedule and runs unattended cannot contain a step that might take 26 minutes and produce nothing, so `think=False` is passed explicitly on every call rather than relying on any default.
+
+This also closed the model question. At 2.1 seconds per call the 9B model is comfortably fast enough for planner, critic, and writer, so Sprint 1 runs entirely on one model with zero swaps. Routing to Phi-4-mini would cost a 6 second reload to save roughly a second, which is a losing trade until Sprint 7 produces real quality data to justify it. Model bindings per role come from config rather than source, so that routing change stays a config edit rather than a refactor.
+
+One risk stays open and is deliberately recorded rather than assumed away: `think=False` was verified only on a trivial prompt. Whether it degrades output on planner-shaped prompts, a goal plus tool schemas producing a decomposed task list, is untested. If it does, the fallback is not to re-enable thinking but to request a `reasoning` field inside the structured output schema, which is bounded, inspectable, and loggable, unlike opaque thinking tokens. Sprint 6's observability requirements want that reasoning logged regardless.
+
+## The human approval gate is a hard rule, not a confidence threshold
+
+Any action visible outside the machine queues for human approval regardless of the model's confidence score. Confidence is allowed to decide whether an internal fact gets double-checked before being saved. Confidence is never allowed to decide whether an external action skips human review. This is a deliberate, non-negotiable line, not a tunable parameter.
+
+## Sprint 2
 
 ## MCP SDK v2 instead of the v1 pin
 

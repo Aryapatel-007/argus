@@ -246,8 +246,12 @@ orchestrator's.
 ## Current state — Sprint 2
 
 Sprint 1 closed. Hand-built plan/act/observe/critique state machine,
-SQLite-checkpointed after every transition, crash-resume verified against
-real Ollama. Migration chain at 001c.
+SQLite-checkpointed after every transition. Crash-resume proven against real
+Ollama for both LLM-call-in-flight scenarios (planner and critic), 24/24
+checks each. The between-steps window (~0-6ms) was tested across 5 attempts
+and recorded as INCONCLUSIVE — too narrow for a separate process to reliably
+target. Unit tests exercise the same transition logic but do not close this
+gap; it stays open. Migration chain at 001c.
 
 Sprint 2 goal: the memory server as a real custom MCP server, SQLite plus
 sqlite-vec, tested standalone before the orchestrator touches it.
