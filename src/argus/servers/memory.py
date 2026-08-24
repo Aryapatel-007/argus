@@ -1,6 +1,19 @@
 """Argus memory MCP server.
 
-    python -m argus.servers.memory --db-path <path> --run-id <id>
+Run: python -m argus.servers.memory --db-path <path> --run-id <id>
+     (with src/ on PYTHONPATH)
+     python src/argus/servers/memory.py --db-path <path> --run-id <id>
+
+The `-m` form needs `src/` on PYTHONPATH because this repo has no editable
+install (`pip install -e .`) — `-m` resolves the module against sys.path
+before any of this file's own code runs, so the sys.path bootstrap two lines
+down cannot rescue it the way it rescues direct-script execution. Confirmed:
+`python -m argus.servers.memory ...` run bare from the repo root fails with
+`ModuleNotFoundError: No module named 'argus'`; the identical failure
+reproduces on `runner.py` and `migrate.py`'s own documented `-m` commands
+run bare — this is a repo-wide gap, not specific to this module. Matches the
+convention `migrate.py` already documents and `crash_test.py` already relies
+on when it spawns `runner.py` (`env["PYTHONPATH"] = str(SRC) + ...`).
 
 Spawned per run by the orchestrator over stdio. `--run-id` is how embedding
 calls become attributable in `llm_calls` without putting a run id into the
