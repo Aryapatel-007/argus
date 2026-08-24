@@ -213,8 +213,14 @@ owns facts, facts_vec. Both write llm_calls — the memory server logs its
 embedding calls with role='embedder'. The write lock is database-wide, not
 per-table; ownership is for clarity, not for concurrency.
 
-Only the orchestrator runs migrations. The memory server reads
-PRAGMA user_version at startup and exits with a clear error on mismatch.
+Only the orchestrator runs migrations. The memory server reads the
+schema_migrations table at startup and exits with a clear error unless
+migration 002 is present and applied. It never runs migrations itself.
+
+Migration state lives in the `schema_migrations` table — one row per applied
+filename. `PRAGMA user_version` is NOT used and reads 0 even on a fully
+migrated database, so anything that trusts it concludes nothing has run.
+Guarded by a test, so the two can't start disagreeing silently.
 
 Load sqlite-vec on every connection that opens the file, including the
 orchestrator's.
