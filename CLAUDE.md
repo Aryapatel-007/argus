@@ -5,7 +5,7 @@ Local-first autonomous multi-agent monitoring system. Watches a list of targets
 finds, detects changes, and proposes actions that always wait for human approval.
 
 Solo project, built by a BTech CSE student as a portfolio centerpiece. Built in
-sprints, currently Sprint 1.
+sprints, currently Sprint 2.
 
 ---
 
@@ -161,7 +161,18 @@ argus/
 - Install dependencies only in the sprint that needs them. Do not pre-install
   MCP SDK, sqlite-vec, Browser Use, or APScheduler ahead of time — version drift
   before first use is a real cost.
-- Pin `mcp < 2` when the MCP SDK does get installed.
+- Pin `mcp>=2.0,<3`. Re-examined in Sprint 2: v2 is the stable line as of
+  2026-07-28 and `pip install mcp` resolves to it. v1 is maintenance-only.
+  The port from v1 course material is small for a decorator-built server:
+  `from mcp.server import MCPServer` replaces
+  `from mcp.server.fastmcp import FastMCP`; `@mcp.tool()` is unchanged.
+- MCP tools are always `async def`. In v2 a sync `def` tool runs on a worker
+  thread, and `sqlite3.Connection` is thread-affine.
+- A stdio MCP server owns stdout. All logging goes to stderr or a file.
+  Never `print()` in a server module.
+- Load sqlite-vec with `sqlite_vec.load(conn)`, never
+  `conn.load_extension()`. On Windows `loadable_path()` returns a path with
+  no extension and that bare path does not exist; `load()` resolves it.
 - `think` is a TOP-LEVEL field on Ollama chat/generate, not inside `options`.
   Pass `think=False` explicitly on EVERY call, every role. Never rely on the
   default.
@@ -176,6 +187,37 @@ argus/
 - Log structured rows, not print statements. Every plan, every tool call with
   latency and token count, every critic verdict.
 - On Windows, `python` not `python3`.
+
+---
+
+## Storage concurrency — two writers, one file
+
+The orchestrator and the memory server both write to the same SQLite file.
+WAL permits one writer at a time, not one writer process. Three rules,
+non-negotiable, on every connection in both processes:
+
+1. `PRAGMA busy_timeout=5000` immediately after connect.
+2. `BEGIN IMMEDIATE` for any transaction that will write. `busy_timeout`
+   does not apply when a deferred transaction upgrades from read to write —
+   that returns SQLITE_BUSY instantly regardless of timeout. Python's
+   sqlite3 defaults to deferred, so use `isolation_level=None` and issue
+   `BEGIN IMMEDIATE` explicitly.
+3. Never hold a transaction open across an Ollama call. Embed first,
+   then write.
+
+Verified in Sprint 2: two processes, 200 BEGIN IMMEDIATE writes each,
+400 rows landed, zero OperationalError.
+
+Table ownership: orchestrator owns runs, tasks, checkpoints. Memory server
+owns facts, facts_vec. Both write llm_calls — the memory server logs its
+embedding calls with role='embedder'. The write lock is database-wide, not
+per-table; ownership is for clarity, not for concurrency.
+
+Only the orchestrator runs migrations. The memory server reads
+PRAGMA user_version at startup and exits with a clear error on mismatch.
+
+Load sqlite-vec on every connection that opens the file, including the
+orchestrator's.
 
 ---
 
@@ -195,28 +237,39 @@ argus/
 
 ---
 
-## Current state — Sprint 1
+## Current state — Sprint 2
 
-Sprint 0 closed. Environment works, GPU discovery confirmed at `library=CUDA`.
-`qwen3.5:9b`, `phi4-mini`, `nomic-embed-text` all present locally. Full Sprint 0
-measurements live in `notes/sprint-0.md`.
+Sprint 1 closed. Hand-built plan/act/observe/critique state machine,
+SQLite-checkpointed after every transition, crash-resume verified against
+real Ollama. Migration chain at 001c.
 
-Goal: hand-build the plan/act/observe/critique state machine in plain Python,
-checkpointed to SQLite after every transition, resumable after a crash.
+Sprint 2 goal: the memory server as a real custom MCP server, SQLite plus
+sqlite-vec, tested standalone before the orchestrator touches it.
 
-Crash-resume proven against real Ollama (`scripts/crash_test.py`) for both
-LLM-call-in-flight scenarios. Between-steps mode covered by unit tests
-instead — the real window is narrower than a separate process can reliably
-target.
+Decisions made at the top of Sprint 2:
+- MCP SDK v2, replacing the earlier `mcp<2` pin.
+- Embeddings are generated inside the memory server, not the orchestrator.
+  Tool surface stays semantic (`query: str`), write/query symmetry is
+  guaranteed by construction, and no 768-float arrays cross stdio.
+- The memory server is spawned per run and receives `--run-id`, so embedding
+  calls are attributable in llm_calls without polluting the model-facing
+  tool schema.
+- Idempotency key lives on `approvals`, not `tasks`. It must survive across
+  runs; a task does not. `tasks.idempotency_key` is dropped in 002.
+- Retrieval ships relevance + recency at 0.7/0.3. The `importance` column
+  exists in 002 but stays NULL until Sprint 5, treated as a neutral constant
+  by the scorer.
+- Entity resolution in Sprint 2 is exact `entity_key` match only. Fuzzy
+  matching is Sprint 4.
 
-Deliberately NOT in this sprint: LangGraph, real MCP servers, sqlite-vec,
-Browser Use, APScheduler, the `facts` and `approvals` tables.
+Measured in Sprint 2 Step 0:
+- qwen3.5:9b and nomic-embed-text ARE co-resident. Embeddings run inline per
+  fact. No batching, no swap cost.
+- sqlite-vec 0.1.9 loads cleanly on Windows via sqlite_vec.load().
+- Node 24.11.1, past the 22.19.0 floor for MCP Inspector v2.
 
-Tables created this sprint (migration 001): `schema_migrations`, `runs`, `tasks`,
-`checkpoints`, `llm_calls`. WAL mode on. Sprint 2 adds `facts` and `approvals`
-as migration 002.
-
-### Open — resolve before or during the build
-
-Nothing open. Sprint 1's three items were all closed — see
-`notes/sprint-1.md`.
+Open and unverified:
+- `think=False` quality on writer-shaped prompts. Probe before wiring.
+- Co-residency was measured with nothing else running. Sprint 3 adds a
+  browser; re-measure then.
+- Single-shot planner. Sprint 4. Do not fix here.
