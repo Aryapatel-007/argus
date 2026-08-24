@@ -34,6 +34,7 @@ from mcp.server import MCPServer  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from argus import embeddings  # noqa: E402
+from argus.servers import scoring  # noqa: E402
 from argus.storage import db  # noqa: E402
 
 SERVER_NAME = "argus-memory"
@@ -76,6 +77,27 @@ class RememberResult(BaseModel):
     )
 
 
+class RecalledFact(BaseModel):
+    """One retrieved fact plus the score components that ranked it.
+
+    `relevance` and `recency` are exposed alongside the blended `score` on
+    purpose: they are the only way to answer "why did this rank here?" when
+    Sprint 6/7 debugging turns up a bad ordering. A single opaque number would
+    make that undiagnosable.
+    """
+
+    fact_id: int
+    target_id: str
+    entity_key: str
+    content: str
+    attributes: Optional[dict] = None
+    score: float = Field(description="Blended rank score, higher is better.")
+    relevance: float = Field(description="Semantic closeness to the query, 0-1.")
+    recency: float = Field(description="Freshness of last_seen_at, 0-1.")
+    last_seen_at: str
+    source_url: Optional[str] = None
+
+
 class EmptyContentError(ValueError):
     """Raised for blank content. Surfaces to the model as a readable message.
 
@@ -84,6 +106,15 @@ class EmptyContentError(ValueError):
     a real fact downstream (measured — see notes/sprint-2.md). Something has to
     say no, and it has to be the caller-facing layer, because only here is it
     knowable that a blank fact is a mistake rather than a legitimate vector.
+    """
+
+
+class EmptyQueryError(ValueError):
+    """Raised for a blank recall query. Same reasoning as EmptyContentError.
+
+    A whitespace query embeds into a perfectly valid vector that will happily
+    return the five facts nearest to nothing in particular. Silently answering
+    a question nobody asked is worse than refusing.
     """
 
 
@@ -310,6 +341,113 @@ class MemoryServer:
                     first_seen_at=current["first_seen_at"],
                 )
 
+    async def recall_facts(
+        self,
+        query: str,
+        target_id: Optional[str] = None,
+        limit: int = 5,
+        min_confidence: float = 0.0,
+    ) -> list[RecalledFact]:
+        """Semantic search over CURRENT facts, ranked by relevance and recency.
+
+        The candidate pool is narrowed BEFORE the KNN, not after it. Eligible
+        fact_ids are selected from `facts` first (is_current, target_id,
+        confidence) and passed into the vector query as a `fact_id IN (...)`
+        prefilter — verified to work alongside MATCH at sqlite-vec 0.1.9. The
+        post-hoc alternative (KNN top-k, then drop the wrong-target rows) makes
+        `limit` a lie: asking for 5 could return 1 because the other 4 belonged
+        to a different target.
+
+        Every eligible candidate is scored, not just the KNN's top `limit`.
+        That is required for correctness, not thoroughness: the final ranking
+        blends recency, so a fact ranked 8th by pure distance can legitimately
+        finish 1st. Truncating at the KNN would silently drop it before recency
+        was ever considered. `limit` is applied last, to the fully sorted list.
+
+        Query text is embedded with NO prefix, exactly as stored fact text is —
+        see notes/sprint-2.md Step 6 Part A, where ten fact-shaped pairs picked
+        unprefixed over both `search_document:` forms on mean margin and
+        inversion count. There is deliberately no query/document asymmetry.
+        """
+        if not query or not query.strip():
+            raise EmptyQueryError(
+                "query must not be empty or whitespace-only. A blank query "
+                "embeds into a valid vector and would return whichever facts "
+                "happen to sit nearest to nothing in particular, which reads "
+                "like an answer but is not one. Pass the actual question."
+            )
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+
+        with db.connect(self.db_path) as conn:
+            # Eligibility, resolved in SQL. is_current = 1 is enforced HERE, in
+            # the query that builds the candidate pool - a superseded fact is
+            # never a candidate, rather than being fetched and filtered out
+            # afterwards.
+            #
+            # NULL confidence PASSES any min_confidence filter. Rationale:
+            # confidence is nullable and unset means "not assessed", not
+            # "assessed as zero". SQL's own `NULL >= 0.5` is NULL (falsy), so
+            # relying on default behaviour would silently drop every fact whose
+            # confidence was never scored - including everything written before
+            # confidence scoring exists. COALESCE makes the choice explicit.
+            sql = (
+                "SELECT fact_id FROM facts "
+                "WHERE is_current = 1 AND COALESCE(confidence, 1.0) >= ?"
+            )
+            params: list = [min_confidence]
+            if target_id is not None:
+                sql += " AND target_id = ?"
+                params.append(target_id)
+
+            eligible = [row["fact_id"] for row in conn.execute(sql, params)]
+            if not eligible:
+                # No candidates is a normal answer, not an error: a first run
+                # against a new target legitimately knows nothing yet.
+                return []
+
+            # Embed OUTSIDE any transaction (CLAUDE.md) - though this path takes
+            # no write lock at all, being read-only.
+            query_vector = await embeddings.embed(
+                query.strip(), run_id=self.run_id, conn=conn
+            )
+            query_blob = embeddings.serialize(query_vector)
+
+            placeholders = ", ".join("?" for _ in eligible)
+            rows = conn.execute(
+                f"SELECT v.fact_id, v.distance, f.target_id, f.entity_key, "
+                f"f.content, f.attributes, f.last_seen_at, f.source_url "
+                f"FROM facts_vec v JOIN facts f ON f.fact_id = v.fact_id "
+                f"WHERE v.embedding MATCH ? AND k = ? "
+                f"AND v.fact_id IN ({placeholders})",
+                [query_blob, len(eligible), *eligible],
+            ).fetchall()
+
+        scored = []
+        for row in rows:
+            score, relevance, recency = scoring.score_candidate(
+                row["distance"], row["last_seen_at"]
+            )
+            scored.append(
+                RecalledFact(
+                    fact_id=row["fact_id"],
+                    target_id=row["target_id"],
+                    entity_key=row["entity_key"],
+                    content=row["content"],
+                    attributes=json.loads(row["attributes"]) if row["attributes"] else None,
+                    score=score,
+                    relevance=relevance,
+                    recency=recency,
+                    last_seen_at=row["last_seen_at"],
+                    source_url=row["source_url"],
+                )
+            )
+
+        # Sort AFTER scoring every candidate, then cap. Ties broken by fact_id
+        # so the ordering is deterministic rather than dependent on row order.
+        scored.sort(key=lambda f: (-f.score, f.fact_id))
+        return scored[:limit]
+
     # -- helpers ------------------------------------------------------------
 
     @staticmethod
@@ -423,6 +561,28 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
             attributes=attributes,
             source_url=source_url,
             confidence=confidence,
+        )
+
+    @mcp.tool(
+        name="recall_facts",
+        description=(
+            "Search remembered facts by meaning, not keywords. Returns the "
+            "best matches ranked by a blend of semantic relevance and how "
+            "recently each fact was seen. Only current facts are searched; "
+            "superseded versions are never returned."
+        ),
+    )
+    async def recall_facts(
+        query: str,
+        target_id: Optional[str] = None,
+        limit: int = 5,
+        min_confidence: float = 0.0,
+    ) -> list[RecalledFact]:
+        return await backend.recall_facts(
+            query=query,
+            target_id=target_id,
+            limit=limit,
+            min_confidence=min_confidence,
         )
 
     return mcp

@@ -120,3 +120,29 @@ no prefix gave the only correct-direction result of the three forms tried
 Shipping unprefixed. Revisit with a larger measured set — three strings is
 enough to catch an inversion, not enough to certify a retrieval strategy — if
 Sprint 6/7 recall quality looks weak.
+
+## Retrieval quality is unresolved, not deferred by design
+
+This is a different kind of entry from the one above it, and the distinction
+matters. "No embedding-prefix on fact content" was a considered choice between
+three tested options, all three of which worked *adequately* on the test set
+used — one just worked best, and it was picked. This entry is not that. It
+records a genuine open problem: a harder, more realistic test found that NONE
+of the three prefix forms worked adequately, and there was no fourth option to
+fall back to.
+
+Five natural phrasings of a query, run against five short facts (two of them a
+"correct" match), unprefixed and under both `search_document:` forms: the best
+form retrieved the right facts on 2 of 5 phrasings. The worst got 0 of 5. This
+is not a form-selection problem — no prefix rescues most of the failures, so
+switching forms again would not fix it. It is nomic-embed-text's discriminative
+power on short, structurally similar fact fragments (two job titles, two
+locations, two money amounts) running out, independent of how the text is
+framed going in.
+
+Not fixed in Sprint 2, and not fixable by more prefix tuning — see
+notes/sprint-2.md, "Retrieval quality risk, carried forward", for the full
+probe, the 5x3 table, and what it means for Sprint 4's diffing and Sprint 7's
+judge calibration, both of which depend on `recall_facts` actually surfacing
+the right candidate. Candidate fixes (a stronger embedding model, hybrid
+keyword+vector search, query rewriting) are named there, not built.

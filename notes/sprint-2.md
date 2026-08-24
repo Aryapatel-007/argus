@@ -345,3 +345,262 @@ CHECK constrains the column to `('added', 'modified', 'removed')`; `'unchanged'`
 never appears there, by construction. **Sprint 4's diff logic needs to know
 this asymmetry exists**: querying `facts.change_kind` will never surface an
 `'unchanged'` row, because that outcome is defined as "no new row."
+
+## Step 6: recall_facts
+
+### Part A — the larger prefix probe (deferred from Step 4b)
+
+Step 4b shipped "no prefix" on **three generic sentence pairs** and explicitly
+flagged that as too small to certify a retrieval strategy. This is the promised
+larger probe: **ten fact-shaped cases** — short realistic fragments of the kind
+a browser-extraction tool actually produces (job postings, program
+requirements, policy snippets), not general prose.
+
+Each case is an (anchor, similar, unrelated) triple. Margin =
+`cos(anchor, similar) − cos(anchor, unrelated)`. Positive means the model
+ranked the genuinely related fragment above the unrelated one, which is the
+only property retrieval needs. Negative is an **inversion** — the model
+preferred the wrong fragment. Reproduce with `python scripts/probe_prefix.py`.
+
+| case | none (sim/unrel/margin) | doc/doc | query/doc |
+|---|---|---|---|
+| job-title | 0.5906 / 0.6926 / **−0.1020** | 0.7293 / 0.7704 / **−0.0411** | 0.6133 / 0.6953 / **−0.0820** |
+| salary | 0.6718 / 0.4929 / +0.1789 | 0.7387 / 0.5259 / +0.2127 | 0.6490 / 0.4630 / +0.1860 |
+| intake-dates | 0.6334 / 0.4694 / +0.1639 | 0.7231 / 0.5156 / +0.2075 | 0.6647 / 0.5142 / +0.1505 |
+| tuition | 0.8059 / 0.4420 / +0.3639 | 0.7949 / 0.4464 / +0.3484 | 0.7190 / 0.4430 / +0.2759 |
+| entry-requirements | 0.7596 / 0.5013 / +0.2583 | 0.7621 / 0.5182 / +0.2439 | 0.7295 / 0.4821 / +0.2474 |
+| visa-policy | 0.8347 / 0.5420 / +0.2927 | 0.8523 / 0.6417 / +0.2106 | 0.8057 / 0.5338 / +0.2719 |
+| duration | 0.7303 / 0.4709 / +0.2594 | 0.7665 / 0.5519 / +0.2146 | 0.6874 / 0.4662 / +0.2211 |
+| english-req | 0.7062 / 0.4128 / +0.2934 | 0.7573 / 0.5235 / +0.2337 | 0.6125 / 0.3919 / +0.2206 |
+| location | 0.5489 / 0.5363 / +0.0126 | 0.6299 / 0.6632 / **−0.0332** | 0.5063 / 0.4787 / +0.0276 |
+| skills | 0.6665 / 0.4219 / +0.2446 | 0.7575 / 0.5177 / +0.2398 | 0.6816 / 0.4619 / +0.2197 |
+| **MEAN MARGIN** | **+0.1966** | +0.1837 | +0.1739 |
+| **INVERSIONS** | **1/10** | 2/10 | **1/10** |
+| **WORST MARGIN** | −0.1020 | −0.0411 | −0.0820 |
+
+**Decision: ship unprefixed. The Step 4b call is CONFIRMED, not overturned.**
+`none` has both the highest mean margin (+0.1966) and joint-fewest inversions
+(1/10). Symmetric `doc/doc` prefixing is again the worst on inversions (2/10),
+reproducing the direction of the 3-pair finding. There is no asymmetry to
+implement: query text and stored fact text are embedded identically, with no
+prefix on either side.
+
+Two things the larger sample revealed that three pairs could not:
+
+1. **Fact-shaped text separates ~10x better than generic prose.** The 3-pair
+   probe's best margin was +0.0209; here it is +0.1966. The earlier number
+   was pessimistic because generic sentences sit in a narrow cosine band. This
+   materially raises confidence that KNN retrieval will work at all.
+2. **`job-title` inverts under ALL THREE forms** (−0.1020 / −0.0411 /
+   −0.0820), and `location` is near-zero. Both are cases where the anchor and
+   the unrelated text are *structurally* the same kind of string — two job
+   titles, two location statements — differing only in content. No prefix
+   choice fixes this; it is a limitation of the embedding model on short
+   structurally-parallel fragments. **Recorded as a known weakness, not
+   solved here.** If Sprint 6/7 recall quality looks weak on short
+   entity-like facts specifically, this table is the reason why, and the fix
+   is a better model or hybrid lexical matching — not a prefix.
+
+### KNN mechanics confirmed at sqlite-vec 0.1.9
+
+Docs (`alexgarcia.xyz/sqlite-vec/features/knn.html`) state vec0's default
+distance is **L2 (Euclidean)**, with `distance_metric=cosine` available at
+table creation. Migration 002's `facts_vec` does **not** set it, so distances
+come back as **L2**.
+
+Measured, not assumed: **nomic-embed-text returns unit-normalized vectors** —
+norms across four real embeddings were 0.9999999288, 0.9999998349,
+1.0000000026, 1.0000000163. That matters because for unit vectors
+`L2² = 2 − 2·cos`, so L2 and cosine rank **identically** and convert exactly.
+Verified on real query/fact pairs, agreement to ~1e-7:
+
+```
+fact 4: vec0_L2=0.698116  cos=0.756316  sqrt(2-2cos)=0.698117  delta=3.79e-07
+fact 3: vec0_L2=1.061570  cos=0.436535  sqrt(2-2cos)=1.061570  delta=1.41e-08
+fact 2: vec0_L2=1.076214  cos=0.420882  sqrt(2-2cos)=1.076214  delta=8.90e-08
+fact 1: vec0_L2=1.092918  cos=0.402765  sqrt(2-2cos)=1.092918  delta=1.01e-07
+```
+
+Also confirmed against the real extension:
+
+- **`fact_id IN (...)` prefiltering works alongside `MATCH`** — so `target_id`
+  narrowing happens PRE-KNN, not as a post-hoc trim of an already-limited
+  result set. This is what lets `limit` be a true cap rather than an upper
+  bound that unrelated-target rows silently eat into.
+- `k = N` larger than the row count returns what exists (4 rows for k=100),
+  no error.
+- `ORDER BY distance LIMIT n` also works (SQLite 3.45.1, past the 3.41+ floor
+  the docs give for LIMIT support); `k =` is used anyway as the documented
+  portable form.
+- KNN against an empty `facts_vec` returns zero rows and does not raise.
+
+### Retrieval is phrasing-sensitive — a real limitation, found while testing
+
+Writing the ranking test surfaced something the Part A table only hinted at.
+Five fixture facts, all sharing a `last_seen_at` (so ordering is *pure*
+relevance), queried five natural ways. Cosine against each fact:
+
+| query | top-2 | correct? |
+|---|---|---|
+| `how much money is involved` | tuition 0.5579, **salary 0.4684** | **yes** |
+| `what does it cost in dollars` | tuition 0.5253, intake 0.4455 | no |
+| `what are the AUD amounts` | **intake 0.5891**, tuition 0.5237 | no |
+| `annual fee and base pay amounts in AUD` | intake 0.6149, tuition 0.6123 | no |
+| `when does it start and what does it cost` | tuition 0.5081, intake 0.4556 | no |
+
+The sharpest case: **`"what are the AUD amounts"` ranks `"Intake dates:
+February and July each year"` FIRST (0.5891)** — above the fact that literally
+contains an AUD amount. `intake` contains no number, no currency, and nothing
+about cost.
+
+This is the same failure mode as Part A's `job-title` and `location`
+inversions: nomic-embed-text is responding to *structural* similarity —
+short, colon-delimited, factual-looking fragments — more than to semantic
+content. Only 1 of 5 phrasings retrieved correctly.
+
+**Not solved here, and the test was not weakened to hide it.**
+`test_semantically_close_facts_rank_above_the_rest` uses the phrasing that
+genuinely works and carries a comment pointing at this table. What this means
+concretely:
+
+- Relevance-only retrieval on short entity-like facts is **not reliable** with
+  this embedding model. The 0.7/0.3 relevance/recency blend does not rescue
+  it — recency is identical across these facts.
+- The likely fixes are a stronger embedding model, or hybrid retrieval pairing
+  vectors with lexical/keyword matching (BM25 or FTS5, already available in
+  SQLite). Both are out of scope for Sprint 2.
+- **Sprint 6/7 should treat this as the leading suspect** if recall quality
+  looks weak, ahead of the scorer weights or the half-life — those are tunable
+  knobs on a signal that is itself noisy here.
+
+## Retrieval quality risk, carried forward
+
+The ranking-test failure above raised a direct question: is the 4-of-5
+phrasing failure a **prefix-form problem** (Part A picked a locally-optimal
+form that a harder test would overturn), or something **upstream of prefix
+choice** (the embedding model's discriminative power on short fact fragments,
+which no prefix can fix)? This section answers that with a dedicated probe,
+states the answer plainly, and records what it means for the rest of the
+project.
+
+### The original 5-phrasing table (from the ranking-test failure)
+
+Five fixture facts sharing one `last_seen_at` (pure relevance, no recency
+contribution), queried five natural ways, unprefixed:
+
+| query | top-2 | correct? |
+|---|---|---|
+| `how much money is involved` | tuition 0.5579, **salary 0.4684** | **yes** |
+| `what does it cost in dollars` | tuition 0.5253, intake 0.4455 | no |
+| `what are the AUD amounts` | **intake 0.5891**, tuition 0.5237 | no |
+| `annual fee and base pay amounts in AUD` | intake 0.6149, tuition 0.6123 | no |
+| `when does it start and what does it cost` | tuition 0.5081, intake 0.4556 | no |
+
+### The 5x3 table — same five phrasings, all three Part A prefix forms
+
+| query | none | doc/doc | query/doc |
+|---|---|---|---|
+| what does it cost in dollars | tuition+intake — no | intake+tuition — no | tuition+intake — no |
+| how much money is involved | tuition+salary — **OK** | intake+tuition — no | tuition+salary — **OK** |
+| what are the AUD amounts | intake+tuition — no | intake+skills — no | intake+skills — no |
+| annual fee and base pay amounts in AUD | intake+tuition — no | intake+tuition — no | salary+tuition — **OK** |
+| when does it start and what does it cost | tuition+intake — no | intake+tuition — no | tuition+library — no |
+| **CORRECT / 5** | **1/5** | **0/5** | **2/5** |
+
+Full per-query cosine detail (reproduce with a probe identical in shape to
+`scripts/probe_prefix.py`, run against these 5 fixture facts instead of the
+Part A pairs):
+
+```
+'what does it cost in dollars'
+  [      none] tuition=0.5253, intake=0.4455, library=0.3592, skills=0.3124, salary=0.2895   FAIL
+  [   doc/doc] intake=0.6183, tuition=0.5578, skills=0.4937, library=0.4541, salary=0.4032   FAIL
+  [ query/doc] tuition=0.5947, intake=0.4699, library=0.4427, salary=0.4307, skills=0.4061   FAIL
+
+'how much money is involved'
+  [      none] tuition=0.5579, salary=0.4684, intake=0.4251, skills=0.3862, library=0.3436   OK
+  [   doc/doc] intake=0.6258, tuition=0.5914, skills=0.5789, salary=0.5665, library=0.4513   FAIL
+  [ query/doc] tuition=0.5946, salary=0.5702, skills=0.4615, intake=0.4389, library=0.4166   OK
+
+'what are the AUD amounts'
+  [      none] intake=0.5891, tuition=0.5237, skills=0.4528, library=0.4299, salary=0.4173   FAIL
+  [   doc/doc] intake=0.7300, skills=0.6265, salary=0.5212, tuition=0.5200, library=0.4872   FAIL
+  [ query/doc] intake=0.5612, skills=0.5294, salary=0.5171, tuition=0.5077, library=0.4568   FAIL
+
+'annual fee and base pay amounts in AUD'
+  [      none] intake=0.6149, tuition=0.6123, salary=0.5697, skills=0.4926, library=0.4304   FAIL
+  [   doc/doc] intake=0.6836, tuition=0.6127, salary=0.6025, skills=0.5812, library=0.4848   FAIL
+  [ query/doc] salary=0.6307, tuition=0.6302, intake=0.5552, skills=0.5107, library=0.4701   OK
+
+'when does it start and what does it cost'
+  [      none] tuition=0.5081, intake=0.4556, library=0.4183, skills=0.3948, salary=0.3416   FAIL
+  [   doc/doc] intake=0.6164, tuition=0.5518, skills=0.5351, library=0.5181, salary=0.4431   FAIL
+  [ query/doc] tuition=0.5328, library=0.4912, intake=0.4461, skills=0.4315, salary=0.4091   FAIL
+```
+
+### Direct answer: upstream embedding-quality problem, not a prefix problem
+
+**No form fixes most phrasings.** Best case (`query/doc`) still fails on 3 of
+5. `none` (Part A's winner) gets 1/5, `doc/doc` gets 0/5. All three forms fail
+on the majority of phrasings, and the best score (2/5 = 40%) is not "most" by
+any reading. Per the criterion this probe was designed to distinguish: this is
+**not** a prefix-tuning problem. The Part A "no prefix" decision is **not
+overturned** — switching to `query/doc` on the strength of a 1-vs-2 gap at n=5
+would be chasing noise, and the instruction not to prefix-tune further on this
+finding is followed: no form selection change is made here.
+
+The failure is upstream: nomic-embed-text's discriminative power on short,
+structurally-parallel fact fragments at this length and style. This is the
+same mechanism Part A's `job-title` and `location` inversions already showed
+— restated here with a harder, multi-candidate ranking test rather than an
+isolated pair comparison, and confirmed to persist across every prefix form
+tried.
+
+### Weak pattern search (n=5 — labeled weak, not a conclusion)
+
+| query | words | overlap(tuition) | overlap(salary) | any form correct? |
+|---|---|---|---|---|
+| what does it cost in dollars | 6 | 0 | 0 | No |
+| how much money is involved | 5 | 1 | 0 | **Yes** |
+| what are the AUD amounts | 5 | 1 | 1 | No |
+| annual fee and base pay amounts in AUD | 8 | 3 | 2 | **Yes** |
+| when does it start and what does it cost | 9 | 0 | 0 | No |
+
+No clean correlate. Query length does not predict success (8 words succeeds,
+9 fails). Word overlap does not either: `"what are the AUD amounts"` has
+literal token overlap with BOTH money facts (`AUD`) and still fails under
+every form, while `"how much money is involved"` succeeds with almost no
+lexical overlap at all — pure paraphrase. The only pattern visible at this
+sample size is that the two queries with **zero word overlap and no
+domain-specific noun** (`cost`, `involved` as the only content-bearing words)
+split one success (paraphrase captured by the model) and one failure
+(`"when does it start..."`, which mixes two questions into one embedding).
+This is five data points; treat it as a place to look, not a finding.
+
+### What this affects downstream
+
+- **Sprint 4's entity-resolution / diffing.** If that logic calls
+  `recall_facts` (or reimplements similar KNN candidate retrieval) to find the
+  existing fact a new observation should compare against, the same
+  discriminative-power limitation applies: a genuinely matching prior fact can
+  rank below an unrelated one on short, structurally similar content.
+- **Sprint 7's judge calibration.** Judge scoring assumes `recall_facts`
+  surfaces the right candidate fact to evaluate. If retrieval itself is
+  unreliable on short facts, a judge score is only as good as a candidate set
+  that may not contain the right answer — a judge cannot rescue a retrieval
+  miss.
+
+### Candidate mitigations for later (named, not evaluated, not built)
+
+1. **A larger or different embedding model.** Direct fix for discriminative
+   power, at whatever VRAM/latency cost that carries — unmeasured.
+2. **Hybrid keyword + vector search** — BM25 or SQLite's own FTS5, merged with
+   KNN. Lexical matching would likely catch exactly the cases vectors miss
+   here (e.g. the literal `AUD` overlap that cosine still ranked wrong).
+3. **Query rewriting before embedding** — expanding or restructuring the
+   query text ahead of the embed call. Unexplored; interacts with the prefix
+   question rather than replacing it.
+
+None of these are built in Sprint 2. This section exists so the next person
+touching retrieval starts from a measured, characterized problem instead of
+rediscovering it from a confusing ranking result.
