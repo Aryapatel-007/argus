@@ -23,7 +23,7 @@ import httpx
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from argus import config  # noqa: E402
+from argus import config, ollama_client  # noqa: E402
 from argus.orchestrator import llm  # noqa: E402
 from argus.orchestrator.context import RunContext  # noqa: E402
 from argus.storage import db  # noqa: E402
@@ -95,7 +95,11 @@ class LLMTestCase(unittest.TestCase):
 
         RecordingClient.instances = []
         RecordingClient.queue = []
-        patcher = mock.patch.object(llm, "Client", RecordingClient)
+        # Patched on argus.ollama_client, not llm: get_client (llm._get_client)
+        # moved there in Sprint 2's layering fix, and Python resolves a bare
+        # name inside a function against ITS OWN module's globals, not the
+        # importer's — patching llm.Client would silently stop intercepting.
+        patcher = mock.patch.object(ollama_client, "Client", RecordingClient)
         patcher.start()
         self.addCleanup(patcher.stop)
 

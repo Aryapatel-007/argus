@@ -17,32 +17,41 @@ behind the record of the call that really happened and really cost 120s.
 
 from __future__ import annotations
 
-import functools
 import json
 import sqlite3
-import uuid
 from pathlib import Path
 from string import Template
 from typing import Any, Dict, Literal, Optional, Tuple, Type
 
 import httpx
-from ollama import Client
 from pydantic import BaseModel, Field, ValidationError
 
 from argus import config
+from argus.ollama_client import (  # noqa: F401 - re-exported, see module docstring
+    TIMEOUT_SECONDS,
+    close_async_clients,
+    get_async_client,
+    get_client as _get_client,
+    log_call,
+    reset_async_clients,
+)
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 #: Top-level chat field, not an options key. See module docstring.
 THINK = False
 KEEP_ALIVE = "30m"
-TIMEOUT_SECONDS = 120
 TEMPERATURE = 0
-NS_PER_S = 1_000_000_000
 
 #: Attempts per call: the first, plus one retry that feeds the validation error
 #: back to the model.
 MAX_SCHEMA_ATTEMPTS = 2
+
+# Sync client cache, get_async_client, log_call, TIMEOUT_SECONDS and the
+# async-client lifecycle helpers now live in argus.ollama_client, shared with
+# argus.embeddings. Imported and re-exported above under their original names
+# (get_client as _get_client) so every existing caller and test in this
+# module and its test suite keeps working unmodified.
 
 
 # ---------------------------------------------------------------------------
@@ -97,20 +106,8 @@ def render_prompt(prompt_file: str, context_vars: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# the single seam over the network — tests patch this
+# the single seam over the network — tests patch Client, in argus.ollama_client
 # ---------------------------------------------------------------------------
-
-
-@functools.lru_cache(maxsize=4)
-def _get_client(host: Optional[str], timeout: int) -> Client:
-    """One client per (host, timeout), reused across calls.
-
-    Cached because each ollama.Client wraps its own httpx.Client and therefore
-    its own connection pool. Building one per call leaks a pool per call and
-    throws away keep-alive, which matters here: keep_alive="30m" holds the
-    model resident precisely so consecutive calls skip the 6s cold load.
-    """
-    return Client(host=host, timeout=timeout)
 
 
 def _invoke(model_tag: str, messages: list, schema: Dict[str, Any]) -> Any:
@@ -132,15 +129,8 @@ def _invoke(model_tag: str, messages: list, schema: Dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# logging
+# logging — log_call itself lives in argus.ollama_client, imported above
 # ---------------------------------------------------------------------------
-
-
-def _tok_s(eval_count: Optional[int], eval_duration_ns: Optional[int]) -> Optional[float]:
-    """Same formula as scripts/probe_thinking.py."""
-    if not eval_count or not eval_duration_ns:
-        return None
-    return eval_count / (eval_duration_ns / NS_PER_S)
 
 
 def _log_call(
@@ -155,42 +145,21 @@ def _log_call(
     error: Optional[str],
     raw_response: Optional[str],
 ) -> None:
-    """Insert one llm_calls row. Called for EVERY attempt, success or not.
-
-    Runs outside any transaction (db.connect is autocommit), so the row commits
-    immediately and survives a later rollback of the step that made the call.
-    """
-    if conn is None:
-        return
-
-    conn.execute(
-        "INSERT INTO llm_calls ("
-        "call_id, run_id, task_id, step_index, role, model_tag, think_mode, "
-        "prompt_file, prompt_eval_count, eval_count, eval_duration_ns, "
-        "total_duration_ns, tok_s, ok, timed_out, error, raw_response"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            str(uuid.uuid4()),
-            ctx.run_id,
-            ctx.current_task["task_id"] if ctx and ctx.current_task else None,
-            ctx.step_index if ctx else None,
-            role,
-            model_tag,
-            str(THINK),
-            prompt_file,
-            getattr(response, "prompt_eval_count", None),
-            getattr(response, "eval_count", None),
-            getattr(response, "eval_duration", None),
-            getattr(response, "total_duration", None),
-            _tok_s(
-                getattr(response, "eval_count", None),
-                getattr(response, "eval_duration", None),
-            ),
-            1 if ok else 0,
-            1 if timed_out else 0,
-            error,
-            raw_response,
-        ),
+    """Chat-call adapter over `log_call`: unpacks the RunContext."""
+    log_call(
+        conn,
+        run_id=ctx.run_id,
+        task_id=ctx.current_task["task_id"] if ctx and ctx.current_task else None,
+        step_index=ctx.step_index if ctx else None,
+        role=role,
+        model_tag=model_tag,
+        think_mode=str(THINK),
+        prompt_file=prompt_file,
+        response=response,
+        ok=ok,
+        timed_out=timed_out,
+        error=error,
+        raw_response=raw_response,
     )
 
 

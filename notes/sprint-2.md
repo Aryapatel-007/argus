@@ -245,3 +245,91 @@ Also verified out-of-band, on a **copy** of the real `data/argus.db` (which
 was at 001c): `002` applies as exactly one migration, a re-run is a clean
 no-op, `integrity_check` returns ok, `foreign_key_check` is empty, and the
 existing 10 runs / 70 checkpoints are preserved.
+
+## Step 4: embedding module
+
+`src/argus/embeddings.py` — async `embed()`, `serialize()`, and `llm_calls`
+logging with `role='embedder'`, built against real `nomic-embed-text` calls.
+
+### Empty string: neither error nor zeros
+
+Negative control. `nomic-embed-text` returns an ordinary **unit vector**
+(norm 1.0, non-zero components) for `""`, and `"   "` returns the
+**byte-identical** vector to `""`. Not rejected, not zeroed — a real,
+storable, queryable vector, indistinguishable downstream from a real fact.
+
+`embeddings.py` does **not** reject empty input — silently rewriting a
+caller's text is worse than embedding what was given. **The reject gate
+belongs in `remember_fact` (Step 5)**, before the text ever reaches this
+module.
+
+### Prefix comparison — ship unprefixed
+
+Measured against three fixed short strings (two similar, one unrelated):
+
+| form | similar | unrelated | margin |
+|---|---|---|---|
+| no prefix | 0.4947 | 0.4738 | **+0.0209** |
+| `search_document:` both sides | 0.5796 | 0.5939 | **−0.0142** (inverted) |
+| `search_query:` / `search_document:` | 0.4589 | 0.4327 | +0.0262 |
+
+Nomic's documented task prefixes did not help on this data: symmetric
+`search_document:` prefixing **inverted** the ranking, and only the unprefixed
+form gave a clean, correctly-signed margin among the two forms compared on
+equal footing. **Decision: ship Step 6 with no prefix.** Revisit with a
+larger measured set if Sprint 6/7 recall quality looks weak — three strings is
+a smoke test, not a benchmark.
+
+### The lru_cache-across-event-loops bug
+
+`get_async_client` was first written as a plain `functools.lru_cache` keyed on
+`(host, timeout)`. `httpx.AsyncClient` binds its connection pool to the event
+loop that constructed it, so a client built under one loop and reused under a
+different one fails with `RuntimeError: Event loop is closed`.
+
+**Production would never have hit this** — the memory server runs a single
+event loop for its entire life, so there is only ever one loop to key against.
+**The test suite caught it** because `unittest.IsolatedAsyncioTestCase` opens
+a fresh loop per test method; the second test to call `embed()` reused the
+first test's now-dead loop's client and failed immediately.
+
+Fixed by keying on the running loop as well, via a `weakref.WeakKeyDictionary`
+so a dead loop's entry is collected with it. A regression test is committed
+(`test_a_second_event_loop_does_not_inherit_a_dead_client`) that runs a second
+loop in a real OS thread and asserts it gets a distinct client — this is the
+one case an ordinary same-thread test cannot reproduce, since `asyncio.run()`
+cannot nest inside a running loop.
+
+### Layering fix: embeddings.py no longer imports argus.orchestrator.*
+
+`argus.embeddings` originally imported `TIMEOUT_SECONDS`, `get_async_client`
+and `log_call` from `argus.orchestrator.llm` — backwards, since the memory
+server (a peer of the orchestrator, not a dependent) would have pulled in the
+whole orchestrator package just to log an embedding call.
+
+Extracted the shared plumbing (sync client cache, async client cache, `tok_s`,
+`log_call`, `TIMEOUT_SECONDS`) into a new neutral module,
+`src/argus/ollama_client.py`. `argus.orchestrator.llm` now imports from it and
+re-exports the original names (`get_client as _get_client`, etc.) so nothing
+in the orchestrator or its existing tests changed call signature or behavior.
+`argus.embeddings` imports from `argus.ollama_client` directly.
+
+Verified by a real import-graph check, not by eye:
+`test_importing_embeddings_does_not_pull_in_orchestrator` runs
+`import argus.embeddings` in a fresh subprocess interpreter and asserts
+`'argus.orchestrator'` is absent from `sys.modules` afterward.
+
+One necessary side effect: `test_llm.py` mocked the network seam via
+`mock.patch.object(llm, "Client", RecordingClient)`. Python resolves a bare
+name inside a function against *that function's own module's* globals, not the
+importer's — so once `get_client`'s body moved to `ollama_client.py`, patching
+`llm.Client` would silently stop intercepting anything (the function now reads
+`ollama_client.Client`). The patch target was updated to
+`mock.patch.object(ollama_client, "Client", RecordingClient)` so the mock keeps
+doing what it always did — intercept the network call, not let it through.
+This is the one test line that had to change to keep behavior, not signatures,
+identical.
+
+### Tests: 105 passing, 0 failing
+
+Up from 104. New: the import-graph isolation check.

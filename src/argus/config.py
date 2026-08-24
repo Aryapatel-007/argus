@@ -25,6 +25,10 @@ DEFAULT_ROLE_MODEL_KEYS = {
     "writer": "chat",
     "judge": "chat",
     "router": "fast",
+    # Sprint 2. The one role that is NOT a chat model — it resolves to
+    # models.embed so the embedder goes through model_for_role() like every
+    # other role, rather than reaching into the config dict for a raw tag.
+    "embedder": "embed",
 }
 
 

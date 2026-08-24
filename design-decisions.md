@@ -66,3 +66,18 @@ task that requested it. `tasks.idempotency_key` is dropped in migration 002
 rather than left in place unused, because a dead column with the right name in
 the wrong place is exactly what makes Sprint 5 re-open this argument instead of
 finding it already settled.
+
+## No embedding-prefix on fact content
+
+nomic-embed-text documents `search_query:` / `search_document:` task prefixes
+as improving retrieval. Tested against plain unprefixed text on real short
+facts before adopting them, rather than assuming the documented default is
+correct for this content. It measurably wasn't: symmetric `search_document:`
+prefixing on both sides of a similar/unrelated comparison **inverted** the
+margin (similar pair scored *lower* than the unrelated pair, −0.0142), while
+no prefix gave the only correct-direction result of the three forms tried
+(+0.0209).
+
+Shipping unprefixed. Revisit with a larger measured set — three strings is
+enough to catch an inversion, not enough to certify a retrieval strategy — if
+Sprint 6/7 recall quality looks weak.
