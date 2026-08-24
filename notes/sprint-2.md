@@ -604,3 +604,69 @@ This is five data points; treat it as a place to look, not a finding.
 None of these are built in Sprint 2. This section exists so the next person
 touching retrieval starts from a measured, characterized problem instead of
 rediscovering it from a confusing ranking result.
+
+## Step 7: list_changes_since
+
+Third and final Sprint 2 tool. No facts_vec, no embed() call, no llm_calls
+row — ever. Confirmed by test, not assumed: `TestListChangesNoEmbedding`
+builds its fixture via direct SQL (bypassing `remember_fact` entirely) so the
+guarantee holds independent of whether Ollama is even reachable, and asserts
+`embed_call_count() == 0` after a real call through the tool. This makes
+`list_changes_since` the one memory-server tool fully unaffected by the
+retrieval-quality risk in Step 6 — if a fact's history looks wrong, the bug
+is in `remember_fact` or upstream of it, never in embedding quality.
+
+### created_at, not last_seen_at — the decision that looks equivalent until it isn't
+
+"Changed since X" is answered against each row's own `created_at`, never
+`last_seen_at`. The two columns move on different triggers:  `created_at` is
+written once, at INSERT, and never touched again; `last_seen_at` is bumped on
+every re-observation, including Step 5's `'unchanged'` path, which touches
+`last_seen_at` on the *existing* row without writing a new one. A fact from
+months ago that was simply re-observed yesterday would look like a fresh
+change today under `last_seen_at` — silently wrong, and easy to not notice,
+because both columns hold the same value on the common case (a fact seen once
+and never touched again).
+
+Proven under a real gap through the real write path, not just asserted in a
+comment: `TestListChangesCreatedAtSemantics` writes an `'added'` fact, sleeps
+0.2s, records a boundary timestamp, sleeps another 0.2s, writes a `'modified'`
+version, then queries `since=boundary`. Result: only the `'modified'` row
+comes back. Had the query used `last_seen_at` instead, the `'added'` row would
+also have satisfied the filter — `last_seen_at` gets set to "now" on every
+write, so both rows would pass regardless of which one actually changed
+inside the window. The test would have passed by accident with the wrong
+column; using a boundary strictly between the two real `created_at` values is
+what makes the distinction observable at all.
+
+### The previous_content contract for 'removed' rows — a requirement for Sprint 4, not yet a bug
+
+`previous_content` is computed by ONE uniform rule for every `change_kind`:
+a `LEFT JOIN facts prev ON prev.fact_id = f.supersedes_id`. There is no
+`change_kind`-specific branch. This is deliberate — it means `'removed'`
+support required zero removal-specific code, and `TestListChangesRemovedKind`
+confirms it works correctly today, via a manually-inserted row (nothing in
+the codebase produces `'removed'` yet; `remember_fact` only ever writes
+`'added'` or `'modified'`).
+
+But uniform-by-join means the correctness of `previous_content` for a
+`'removed'` row is entirely contingent on that row actually setting
+`supersedes_id` — the same contract `'modified'` rows already satisfy via
+`remember_fact`. **This is a requirement Sprint 4 must implement deliberately
+when it starts writing `'removed'` rows, not something to rediscover as a bug
+after the fact:** if a future writer inserts a `'removed'` row without
+`supersedes_id`, `list_changes_since` will not raise, will not warn — it will
+silently return `previous_content: null` for a removal that clearly had prior
+content. The failure is quiet by construction, which is exactly why it needs
+to be a stated requirement here rather than left to be discovered.
+
+### Tests: 171 passing, 0 failing
+
+Up from 156. Fifteen new: the `created_at`-boundary proof, `previous_content`
+correctness for `'added'`/`'modified'`, the `kinds` and `target_id` filters,
+the manually-constructed `'removed'`-row pair, UTC-strictness for `since`
+(unparseable, timezone-naive, and non-UTC-offset all rejected; `Z` and
+`+00:00` both accepted as the same instant), the empty-window negative
+control, `limit` as a true cap over more matches than the limit, and the two
+no-embedding guarantees (`llm_calls` stays empty, `facts_vec` is never
+touched).

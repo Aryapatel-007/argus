@@ -880,6 +880,312 @@ class TestRecallEmptyAndInvalid(MemoryServerTestCase):
         self.assertTrue(result.is_error)
 
 
+# ---------------------------------------------------------------------------
+# list_changes_since
+# ---------------------------------------------------------------------------
+
+
+class ListChangesTestCase(MemoryServerTestCase):
+    """Shared helpers for list_changes_since tests.
+
+    Two fixture strategies, used deliberately for different things:
+      - `self.remember(...)` through the real tool, when a test needs to prove
+        something about the ACTUAL created_at values SQLite's own DEFAULT
+        produces on the real INSERT path.
+      - `self.insert_fact_row(...)`, direct SQL, when a test needs exact
+        control over created_at/change_kind/supersedes_id that no real code
+        path produces yet (a 'removed' row) or when the test must not depend
+        on Ollama being reachable at all.
+    """
+
+    def insert_fact_row(
+        self,
+        conn,
+        *,
+        fact_id: int,
+        target_id: str = TARGET,
+        entity_key: str = ENTITY,
+        content: str,
+        change_kind: str,
+        version: int,
+        is_current: int = 0,
+        supersedes_id=None,
+        created_at: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO facts (fact_id, target_id, entity_key, content, "
+            "content_hash, version, is_current, supersedes_id, change_kind, "
+            "first_seen_run_id, last_seen_run_id, first_seen_at, last_seen_at, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fact_id, target_id, entity_key, content, f"hash-{fact_id}",
+                version, is_current, supersedes_id, change_kind,
+                RUN_ID, RUN_ID, created_at, created_at, created_at,
+            ),
+        )
+
+    async def changes(self, client, since: str, **kwargs):
+        payload = {"since": since}
+        payload.update(kwargs)
+        return await client.call_tool("list_changes_since", payload)
+
+    @staticmethod
+    def rows_of(result) -> list:
+        return result.structured_content["result"]
+
+    @staticmethod
+    def kinds_of(result) -> list:
+        return [r["change_kind"] for r in result.structured_content["result"]]
+
+
+@requires_ollama
+class TestListChangesCreatedAtSemantics(ListChangesTestCase):
+    async def test_since_boundary_excludes_the_added_row_and_includes_the_modified_one(
+        self,
+    ) -> None:
+        """THE created_at-not-last_seen_at decision, under a REAL gap through
+        the real remember_fact path — not asserted in a comment, tested.
+
+        If this used last_seen_at instead, both rows would still satisfy the
+        filter (last_seen_at is set to "now" on every write), so this test
+        would pass by accident even with the wrong column. Using a boundary
+        strictly between the two real created_at values is what makes the
+        distinction observable.
+        """
+        async with Client(self.mcp) as client:
+            added = await self.remember(client, content=CONTENT_A)
+            await asyncio.sleep(0.2)
+            boundary = memory.utcnow_iso()
+            await asyncio.sleep(0.2)
+            modified = await self.remember(client, content=CONTENT_B)
+
+            result = await self.changes(client, since=boundary)
+
+        ids = [r["fact_id"] for r in self.rows_of(result)]
+        self.assertNotIn(added.structured_content["fact_id"], ids)
+        self.assertIn(modified.structured_content["fact_id"], ids)
+        self.assertEqual(self.kinds_of(result), ["modified"])
+
+
+@requires_ollama
+class TestListChangesPreviousContent(ListChangesTestCase):
+    async def test_added_row_has_null_previous_content(self) -> None:
+        async with Client(self.mcp) as client:
+            await self.remember(client, content=CONTENT_A)
+            result = await self.changes(client, since="2000-01-01T00:00:00.000Z")
+
+        rows = self.rows_of(result)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["change_kind"], "added")
+        self.assertIsNone(rows[0]["previous_content"])
+        self.assertEqual(rows[0]["content"], CONTENT_A)
+
+    async def test_modified_row_carries_the_superseded_content(self) -> None:
+        async with Client(self.mcp) as client:
+            await self.remember(client, content=CONTENT_A)
+            await self.remember(client, content=CONTENT_B)
+            result = await self.changes(client, since="2000-01-01T00:00:00.000Z")
+
+        by_kind = {r["change_kind"]: r for r in self.rows_of(result)}
+        self.assertEqual(by_kind["modified"]["content"], CONTENT_B)
+        self.assertEqual(by_kind["modified"]["previous_content"], CONTENT_A)
+        self.assertIsNone(by_kind["added"]["previous_content"])
+
+
+@requires_ollama
+class TestListChangesFilters(ListChangesTestCase):
+    async def test_kinds_filter_excludes_added_in_the_same_window(self) -> None:
+        async with Client(self.mcp) as client:
+            await self.remember(client, content=CONTENT_A)
+            await self.remember(client, content=CONTENT_B)
+            result = await self.changes(
+                client, since="2000-01-01T00:00:00.000Z", kinds=["modified"]
+            )
+
+        self.assertEqual(self.kinds_of(result), ["modified"])
+
+    async def test_target_id_filter_narrows_across_two_targets(self) -> None:
+        async with Client(self.mcp) as client:
+            await self.remember(client, target_id="target_a", entity_key="e1")
+            await self.remember(client, target_id="target_b", entity_key="e1")
+
+            result = await self.changes(
+                client, since="2000-01-01T00:00:00.000Z", target_id="target_a"
+            )
+
+        rows = self.rows_of(result)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["target_id"], "target_a")
+
+
+class TestListChangesRemovedKind(ListChangesTestCase):
+    """'removed' is unreachable through any real code path today — remember_fact
+    (Step 5) only ever writes 'added' or 'modified'. Built entirely via direct
+    SQL, deliberately: pretending this has real-path coverage would be false.
+    No Ollama needed, since nothing here goes through remember_fact/embed.
+    """
+
+    async def test_removed_row_is_returned_with_previous_content_from_supersedes_id(
+        self,
+    ) -> None:
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="Program fee: AUD 40,000",
+                change_kind="added", version=1, is_current=0,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+            self.insert_fact_row(
+                conn, fact_id=2, content="(no longer listed on the page)",
+                change_kind="removed", version=2, is_current=0,
+                supersedes_id=1, created_at="2026-01-02T00:00:00.000Z",
+            )
+
+        async with Client(self.mcp) as client:
+            result = await self.changes(client, since="2025-12-31T00:00:00.000Z")
+
+        rows = {r["fact_id"]: r for r in self.rows_of(result)}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[2]["change_kind"], "removed")
+        self.assertEqual(rows[2]["previous_content"], "Program fee: AUD 40,000")
+        self.assertEqual(rows[2]["content"], "(no longer listed on the page)")
+
+    async def test_list_changes_does_not_special_case_or_choke_on_removed(self) -> None:
+        """No exception, no silent drop - it is handled by the same generic
+        SELECT + LEFT JOIN as every other change_kind.
+        """
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="x", change_kind="added", version=1,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+            self.insert_fact_row(
+                conn, fact_id=2, content="y", change_kind="removed", version=2,
+                supersedes_id=1, created_at="2026-01-02T00:00:00.000Z",
+            )
+
+        async with Client(self.mcp) as client:
+            result = await self.changes(
+                client, since="2025-12-31T00:00:00.000Z", kinds=["removed"]
+            )
+
+        self.assertFalse(result.is_error, result.content)
+        self.assertEqual(self.kinds_of(result), ["removed"])
+
+
+class TestListChangesTimestampValidation(ListChangesTestCase):
+    async def test_unparseable_timestamp_is_rejected_not_coerced(self) -> None:
+        async with Client(self.mcp) as client:
+            result = await self.changes(client, since="not a date")
+
+        self.assertTrue(result.is_error)
+        self.assertIn("since", result.content[0].text.lower())
+
+    async def test_timezone_naive_timestamp_is_rejected(self) -> None:
+        """Ambiguous, not silently assumed to be UTC."""
+        async with Client(self.mcp) as client:
+            result = await self.changes(client, since="2026-08-24T00:00:00")
+
+        self.assertTrue(result.is_error)
+
+    async def test_non_utc_offset_is_rejected(self) -> None:
+        async with Client(self.mcp) as client:
+            result = await self.changes(client, since="2026-08-24T00:00:00+05:30")
+
+        self.assertTrue(result.is_error)
+
+    async def test_z_suffix_and_explicit_utc_offset_are_both_accepted(self) -> None:
+        """Two spellings of the same instant, both valid."""
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="x", change_kind="added", version=1,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+
+        async with Client(self.mcp) as client:
+            z_form = await self.changes(client, since="2025-12-31T00:00:00.000Z")
+            offset_form = await self.changes(client, since="2025-12-31T00:00:00.000+00:00")
+
+        self.assertFalse(z_form.is_error)
+        self.assertFalse(offset_form.is_error)
+        self.assertEqual(len(self.rows_of(z_form)), 1)
+        self.assertEqual(len(self.rows_of(offset_form)), 1)
+
+
+class TestListChangesEmptyAndLimit(ListChangesTestCase):
+    async def test_empty_window_returns_empty_list_not_an_error(self) -> None:
+        """NEGATIVE CONTROL. A window with zero changes is a normal answer."""
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="x", change_kind="added", version=1,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+
+        async with Client(self.mcp) as client:
+            # since is AFTER the only fact's created_at - nothing qualifies.
+            result = await self.changes(client, since="2026-06-01T00:00:00.000Z")
+
+        self.assertFalse(result.is_error, result.content)
+        self.assertEqual(self.rows_of(result), [])
+
+    async def test_limit_is_a_true_cap_with_more_matches_than_the_limit(self) -> None:
+        with db.connect(self.db_path) as conn:
+            for i in range(1, 6):
+                self.insert_fact_row(
+                    conn, fact_id=i, entity_key=f"e{i}", content=f"content {i}",
+                    change_kind="added", version=1,
+                    created_at=f"2026-01-0{i}T00:00:00.000Z",
+                )
+
+        async with Client(self.mcp) as client:
+            result = await self.changes(
+                client, since="2025-12-31T00:00:00.000Z", limit=3
+            )
+
+        rows = self.rows_of(result)
+        self.assertEqual(len(rows), 3)
+        # Most recent first: fact_id 5, 4, 3 (the three latest created_at).
+        self.assertEqual([r["fact_id"] for r in rows], [5, 4, 3])
+
+
+class TestListChangesNoEmbedding(ListChangesTestCase):
+    """This tool NEVER calls embed(). Checked, not assumed - and deliberately
+    NOT gated on @requires_ollama, since the guarantee needs to hold whether
+    or not Ollama is even reachable. Fixture built via direct SQL for the
+    same reason: this test must not itself be the thing that calls embed().
+    """
+
+    async def test_zero_llm_calls_rows_written(self) -> None:
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="x", change_kind="added", version=1,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+
+        self.assertEqual(self.embed_call_count(), 0)
+
+        async with Client(self.mcp) as client:
+            result = await self.changes(client, since="2025-12-31T00:00:00.000Z")
+
+        self.assertFalse(result.is_error, result.content)
+        self.assertEqual(len(self.rows_of(result)), 1)
+        self.assertEqual(
+            self.embed_call_count(), 0,
+            "list_changes_since must never write an llm_calls row",
+        )
+
+    async def test_facts_vec_is_never_touched(self) -> None:
+        with db.connect(self.db_path) as conn:
+            self.insert_fact_row(
+                conn, fact_id=1, content="x", change_kind="added", version=1,
+                created_at="2026-01-01T00:00:00.000Z",
+            )
+
+        async with Client(self.mcp) as client:
+            await self.changes(client, since="2025-12-31T00:00:00.000Z")
+
+        self.assertEqual(self.vec_ids(), [])
+
+
 class TestStartupAssertion(unittest.TestCase):
     """Refusing to start is the correct behaviour, and it must be loud."""
 
@@ -993,6 +1299,7 @@ class TestEveryToolReturnsStructuredOutput(MemoryServerTestCase):
                 "content": "Probe content for the structured-output regression test.",
             },
             "recall_facts": {"query": "probe query"},
+            "list_changes_since": {"since": "2000-01-01T00:00:00.000Z"},
         }
 
     async def test_every_tool_returns_non_null_structured_content(self) -> None:

@@ -23,7 +23,7 @@ import hashlib
 import json
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
 
@@ -118,6 +118,40 @@ class EmptyQueryError(ValueError):
     """
 
 
+class InvalidTimestampError(ValueError):
+    """Raised when `since` is not an unambiguous, UTC, ISO 8601 timestamp.
+
+    Deliberately strict: a bad `since` is rejected, never silently coerced to
+    "now" or to epoch. Either of those would make list_changes_since return a
+    plausible-looking but wrong answer (everything, or nothing) instead of an
+    error the caller can actually notice and fix.
+    """
+
+
+class FactChange(BaseModel):
+    """One row from the change feed. Mirrors a single facts row, not a diff
+    object synthesized from two rows — the row already IS the change.
+    """
+
+    fact_id: int
+    target_id: str
+    entity_key: str
+    change_kind: Literal["added", "modified", "removed"]
+    version: int
+    content: str
+    previous_content: Optional[str] = Field(
+        default=None,
+        description=(
+            "Content of the row this one superseded, via supersedes_id. "
+            "Null for 'added' rows, which have no prior version."
+        ),
+    )
+    observed_at: str = Field(
+        description="created_at of this fact version - when THIS row came "
+        "into being, not when it was last seen."
+    )
+
+
 # ---------------------------------------------------------------------------
 # startup
 # ---------------------------------------------------------------------------
@@ -187,11 +221,70 @@ def content_hash(content: str, attributes: Optional[dict]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _format_iso(dt: datetime) -> str:
+    """Render a datetime in the schema's own DEFAULT format.
+
+    Millisecond precision, trailing 'Z'. Every timestamp this module writes or
+    compares against goes through this one function, so `created_at` values
+    written by SQLite's own DEFAULT and timestamps written or compared by
+    Python code are always the same shape - which is what makes a plain
+    string comparison in SQL (`created_at > ?`) a valid substitute for parsing
+    both sides as datetimes.
+    """
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
 def utcnow_iso() -> str:
     """Matches the format the schema's own DEFAULT produces."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
-        f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    )
+    return _format_iso(datetime.now(timezone.utc))
+
+
+def parse_since(value: str) -> str:
+    """Validate `since` as an unambiguous UTC ISO 8601 timestamp and return it
+    RE-FORMATTED to the schema's canonical shape.
+
+    Raises InvalidTimestampError rather than coercing, on three distinct
+    failures - each reported with what was actually wrong, not just "invalid":
+      - not parseable as ISO 8601 at all
+      - parseable but missing timezone information (ambiguous: whose local
+        time is it?)
+      - parseable with an explicit non-UTC offset (this project has exactly
+        one clock, UTC, everywhere else - accepting silent offset conversion
+        here would be the one place that assumption quietly stopped holding)
+
+    Re-formatting rather than comparing the raw input string against
+    `created_at` in SQL matters: a caller may reasonably pass
+    "2026-08-24T00:00:00+00:00" instead of "...000Z", and a raw string
+    comparison would silently misorder against the schema's own
+    "...000Z"-suffixed values despite meaning the exact same instant.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidTimestampError(
+            f"'since' must be a non-empty ISO 8601 timestamp string, got {value!r}"
+        )
+
+    candidate = value.strip()
+    try:
+        parsed = datetime.fromisoformat(
+            candidate[:-1] + "+00:00" if candidate.endswith("Z") else candidate
+        )
+    except ValueError as exc:
+        raise InvalidTimestampError(
+            f"'since' is not a valid ISO 8601 timestamp: {value!r} ({exc})"
+        ) from exc
+
+    if parsed.tzinfo is None:
+        raise InvalidTimestampError(
+            f"'since' must include a UTC timezone marker ('Z' or '+00:00'), "
+            f"got a timezone-naive value: {value!r}"
+        )
+    if parsed.utcoffset() != timedelta(0):
+        raise InvalidTimestampError(
+            f"'since' must be UTC (offset +00:00), got offset "
+            f"{parsed.utcoffset()} in {value!r}"
+        )
+
+    return _format_iso(parsed.astimezone(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +541,89 @@ class MemoryServer:
         scored.sort(key=lambda f: (-f.score, f.fact_id))
         return scored[:limit]
 
+    async def list_changes_since(
+        self,
+        since: str,
+        target_id: Optional[str] = None,
+        kinds: Optional[list] = None,
+        limit: int = 50,
+    ) -> list[FactChange]:
+        """The change feed: every fact VERSION whose own created_at falls
+        after `since`, most recent first.
+
+        Ground truth for debugging recall quality: this tool never calls
+        embed(), never touches facts_vec, and writes zero llm_calls rows - it
+        is the one memory-server tool fully unaffected by the retrieval
+        quality risk documented in Step 6 (notes/sprint-2.md). If a fact's
+        history looks wrong, the bug is in remember_fact or upstream of it,
+        never in embedding quality, because this tool never embeds anything.
+
+        THE created_at DECISION. "Changed since X" is answered against each
+        row's OWN created_at - the moment that specific version came into
+        being - not last_seen_at. last_seen_at moves every time an unchanged
+        fact is touched again (Step 5's 'unchanged' path bumps it without
+        writing a new row), so a fact from months ago that was simply
+        re-observed yesterday would look like a change today if last_seen_at
+        were used. created_at is written once, at INSERT, and never updated -
+        it is genuinely immobile, which is the property a change feed needs.
+
+        Not scoped to is_current: a change feed shows history, including
+        versions that have since been superseded again - unlike recall_facts,
+        which deliberately shows only the current snapshot.
+
+        previous_content: content of the row this one's supersedes_id points
+        at, via a LEFT JOIN - not a change_kind-specific branch. This covers
+        'added' (supersedes_id NULL -> previous_content NULL) and 'modified'
+        uniformly, and extends the same rule to 'removed': whatever content
+        existed right before removal is exactly the useful signal a removal
+        entry should carry, and requires nothing removal-specific here. The
+        one thing this means for Sprint 4: a 'removed' row must set
+        supersedes_id, the same contract 'modified' already has, or its
+        previous_content will silently read NULL.
+        """
+        canonical_since = parse_since(since)
+
+        sql = (
+            "SELECT f.fact_id, f.target_id, f.entity_key, f.change_kind, "
+            "f.version, f.content, f.created_at, prev.content AS previous_content "
+            "FROM facts f LEFT JOIN facts prev ON prev.fact_id = f.supersedes_id "
+            "WHERE f.created_at > ?"
+        )
+        params: list = [canonical_since]
+
+        # In the WHERE clause directly: no KNN step here to worry about
+        # ordering the filter around, unlike recall_facts.
+        if target_id is not None:
+            sql += " AND f.target_id = ?"
+            params.append(target_id)
+
+        if kinds is not None:
+            if not kinds:
+                return []
+            placeholders = ", ".join("?" for _ in kinds)
+            sql += f" AND f.change_kind IN ({placeholders})"
+            params.extend(kinds)
+
+        sql += " ORDER BY f.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        with db.connect(self.db_path) as conn:
+            rows = conn.execute(sql, params).fetchall()
+
+        return [
+            FactChange(
+                fact_id=row["fact_id"],
+                target_id=row["target_id"],
+                entity_key=row["entity_key"],
+                change_kind=row["change_kind"],
+                version=row["version"],
+                content=row["content"],
+                previous_content=row["previous_content"],
+                observed_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
     # -- helpers ------------------------------------------------------------
 
     @staticmethod
@@ -583,6 +759,24 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
             target_id=target_id,
             limit=limit,
             min_confidence=min_confidence,
+        )
+
+    @mcp.tool(
+        name="list_changes_since",
+        description=(
+            "List facts that changed after a given UTC timestamp (ISO 8601), "
+            "most recent first. Ground truth for what actually changed - "
+            "does not use embeddings or semantic search."
+        ),
+    )
+    async def list_changes_since(
+        since: str,
+        target_id: Optional[str] = None,
+        kinds: Optional[list] = None,
+        limit: int = 50,
+    ) -> list[FactChange]:
+        return await backend.list_changes_since(
+            since=since, target_id=target_id, kinds=kinds, limit=limit
         )
 
     return mcp
