@@ -671,6 +671,79 @@ control, `limit` as a true cap over more matches than the limit, and the two
 no-embedding guarantees (`llm_calls` stays empty, `facts_vec` is never
 touched).
 
+## Step 9: Inspector session
+
+No server behavior changed in this step — invocation and setup only.
+`notes/inspector-session.md` is the runbook: the verified `npx
+@modelcontextprotocol/inspector` stdio-launch syntax, the real dev database
+(`data/argus.db`, migrated to 002 — see below), and a manual verification
+checklist covering all three tools.
+
+Fixing the invocation itself surfaced a repo-wide gap: `python -m
+argus.servers.memory ...` run bare from the project root fails with
+`ModuleNotFoundError: No module named 'argus'` — and the identical failure
+reproduces on `runner.py`'s and `migrate.py`'s own documented `-m` commands.
+This repo has no editable install (`pyproject.toml` / `pip install -e .`);
+the only place the real convention (`PYTHONPATH=src`) is actually exercised
+is `crash_test.py`'s subprocess spawning, invisibly. `memory.py`'s docstring
+now documents both the `PYTHONPATH` form and the direct-script form
+(`python src/argus/servers/memory.py ...`), matching the convention
+`migrate.py` already had. `runner.py`'s docstring still lacks it — flagged,
+not fixed, out of scope for this step.
+
+`data/argus.db` was migrated to 002 to make a real Inspector session
+possible: backed up first (`data/argus.db.pre-002-backup`, confirmed
+byte-identical via SHA-256 before migrating), migration applied via the real
+migration runner, `integrity_check` clean, zero FK violations, and
+`runs`/`tasks`/`checkpoints`/`llm_calls` row counts matched exactly
+before/after (10/10/70/25). Backup removed once the session closed out
+successfully — no longer needed once 002 was confirmed stable in daily use.
+
+### The run_id FK gap, surfaced by the first real session
+
+The first real Inspector session — launched with `--run-id
+inspector-session-1`, a string with no corresponding `runs` row — failed the
+first `remember_fact` call with a bare `FOREIGN KEY constraint failed`,
+naming neither table nor column. Diagnosis: not a type mismatch
+(`runs.run_id` is TEXT, any string is valid) but a genuinely missing row.
+Isolated which FK actually fires: **`llm_calls.run_id`, not `facts`** — the
+embedding call's own logging insert runs before the facts write, so the
+embed-logging path is what dies first.
+
+**Decision: fail-fast startup check, not a loosened constraint.**
+`facts.first_seen_run_id` / `last_seen_run_id` and `llm_calls.run_id` are
+real provenance data — Sprint 4's diffing and Sprint 7's judge calibration
+both depend on being able to answer "which run first saw this?" and "what
+did this run cost?" A fact attributed to a run that never happened is
+corrupt data, not a harmless label, so the FK stayed exactly as it was. The
+invariant it enforces already holds by construction in real operation —
+`loop._on_init` writes the `runs` row as the first database operation of any
+run, before any tool call — so `assert_run_exists()` costs nothing in the
+orchestrator-spawned path and only ever fires against an invented,
+standalone `--run-id`. Full investigation, the isolation proof, and the
+test suite are in Step 10 below.
+
+### Confirmed: full manual Inspector session passes after the fix
+
+Run against the real dev database, all three tools:
+
+- Tool list showed exactly `remember_fact`, `recall_facts`,
+  `list_changes_since` — no more, no fewer, schemas as documented.
+- `remember_fact` correctly transitioned `added` → `unchanged` on a repeated
+  identical call (not a duplicate `added`).
+- `recall_facts` returned real `relevance` and `recency` components, not
+  just a blended `score`.
+- `list_changes_since` returned correct `previous_content` and `observed_at`
+  semantics (created_at-based, not last_seen_at).
+- `structured_content` was non-null on all three tool calls — the exact bug
+  class fixed in Step 6, re-checked live rather than only in automated
+  tests.
+- Clean process exit; nothing printed to stdout beyond the MCP protocol
+  frames Inspector itself renders.
+
+Step 9 is closed. Cleanup of the throwaway run/fact created during this
+manual session, and the pre-002 backup, is recorded at the end of Step 10.
+
 ## Step 10: the run_id FK gap — found by hand, missed by 171 tests
 
 A real MCP Inspector session, launched with `--run-id inspector-session-1`,
@@ -776,3 +849,25 @@ raises), the real `run-{uuid4hex12}` shape, both `main()` end-to-end paths
 entry point), and a no-regression test confirming that with a real run row
 the full write path still succeeds and attributes `facts.first_seen_run_id`,
 `facts.last_seen_run_id` and `llm_calls.run_id` to the correct run.
+
+### Dev-database cleanup after Step 9's manual session
+
+Two artifacts left behind by the manual investigation, both cleaned from
+`data/argus.db` specifically — no test database or fixture was touched:
+
+- `data/argus.db.pre-002-backup` — the pre-migration backup, confirmed
+  byte-identical to the original via SHA-256 before migrating and no longer
+  needed once 002 was confirmed stable. Deleted.
+- The throwaway `run-8ff374e9cf6e` row and its dependents — one `facts` row
+  (`fact_id 1`, `target_id inspector_test`), the matching `facts_vec` row,
+  and 2 `llm_calls` rows (the embedder calls the manual session made).
+  Deleted in FK-safe order inside one transaction: `facts_vec` → `facts` →
+  `llm_calls` → `runs` (the run had to be last — `llm_calls.run_id` still
+  referenced it up to that point). Confirmed no other table
+  (`tasks`, `checkpoints`, `approvals`) referenced the throwaway run before
+  deleting.
+
+Row counts after cleanup: `runs=10, facts=0, facts_vec=0, llm_calls=25` —
+an exact match against the state recorded before the Inspector session
+began. `PRAGMA integrity_check` clean, zero FK violations. The real dev
+database carries no debris from this investigation.
