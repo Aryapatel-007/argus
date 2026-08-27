@@ -670,3 +670,109 @@ the manually-constructed `'removed'`-row pair, UTC-strictness for `since`
 control, `limit` as a true cap over more matches than the limit, and the two
 no-embedding guarantees (`llm_calls` stays empty, `facts_vec` is never
 touched).
+
+## Step 10: the run_id FK gap — found by hand, missed by 171 tests
+
+A real MCP Inspector session, launched with `--run-id inspector-session-1`,
+failed on the first `remember_fact` call with a bare:
+
+```
+FOREIGN KEY constraint failed
+```
+
+Worth recording in full, because the interesting part is not the bug — it is
+that **171 automated tests could not have caught it**, and thirty seconds of
+manual driving did.
+
+### What actually broke
+
+Not a type mismatch. `runs.run_id` is `TEXT PRIMARY KEY` (real values look
+like `run-10f35f5700b1`, from `loop.new_run`'s
+`f"run-{uuid.uuid4().hex[:12]}"`), so `"inspector-session-1"` is a perfectly
+valid TEXT value. It was purely a **missing row**.
+
+Three foreign keys point at `runs.run_id` from this server's write path:
+
+| table | column(s) |
+|---|---|
+| `llm_calls` | `run_id` |
+| `facts` | `first_seen_run_id`, `last_seen_run_id` |
+| `approvals` | `created_run_id`, `executed_run_id` |
+
+Reproduced and isolated: **`llm_calls` fires first**, not `facts` — the
+embedding call's `log_call` runs before the facts INSERT. Nothing partial
+landed (`llm_calls=0, facts=0, facts_vec=0` after the failure), so the
+transaction boundary held correctly; the only defect was the diagnosis.
+
+### Why the test suite was blind to it
+
+`MemoryServerTestCase.setUp` inserts a `runs` row before constructing the
+server, and so does every other fixture in the suite — 13 `INSERT INTO runs`
+call sites across 4 test files. **Every test constructs a world in which the
+run already exists.** That is not sloppiness; it mirrors real operation. But
+it means the suite never exercised the one thing standalone invocation does
+differently: inventing a run id that was never started.
+
+The general lesson, worth carrying into later sprints: a fixture that always
+sets up the happy world will never test the setup step itself. Manual
+driving found this precisely because Inspector does not run `setUp`.
+
+### The design question, and the decision
+
+Two real options, not just a patch choice:
+
+**(a)** `--run-id` must reference a real `runs` row; validate at startup and
+fail fast.
+**(b)** `--run-id` is an opaque attribution label; drop or loosen the FKs so
+`facts` tolerates a run id with no `runs` row.
+
+**Chose (a).** Reasons, in order of weight:
+
+1. **The architecture already guarantees it.** `loop._on_init` writes the
+   `runs` row as the *first database operation of any run*, before PLAN,
+   before ACT, before any tool call could happen. So in real
+   orchestrator-spawned operation the invariant already holds by
+   construction and the new check never fires. Option (a) costs nothing
+   where it matters.
+2. **The FKs are load-bearing, not decoration.** `facts.first_seen_run_id`
+   is what makes "which run first saw this fact?" answerable — provenance
+   that Sprint 4's diffing and Sprint 7's judge calibration both depend on.
+   `llm_calls.run_id` is what makes per-run cost and latency accounting
+   possible at all. A fact or an embedding cost attributed to a run that
+   never happened is corrupt data, not a harmless label.
+3. **(b) weakens a production invariant to serve a manual-testing
+   convenience.** That trade runs the wrong way. And it is not even cheap:
+   dropping an FK in SQLite requires a full table rebuild, i.e. a migration
+   003, to support something one `INSERT` already solves.
+4. **Standalone invocation was never first-class.** CLAUDE.md is explicit:
+   "The memory server is spawned per run and receives `--run-id`". Nothing
+   spawns it yet — Sprint 2 deliberately kept it standalone for testing —
+   but spawned-per-run is the stated design, not an accident.
+
+### What changed
+
+The real defect was never the constraint; it was that the failure arrived
+**late and cryptic**. `FOREIGN KEY constraint failed` names no table, no
+column, and above all never mentions `--run-id`, which is the actual
+mistake. So:
+
+`assert_run_exists(db_path, run_id)` now runs in `main()`, immediately after
+`assert_migrated()` and before anything is served. Order matters and is
+tested: an unmigrated database has no `runs` table at all, so checking the
+run first would raise `OperationalError` instead of the clear migration
+message. The error names the offending id, explains why it cannot own facts,
+and **lists real run ids from the database** — turning "that's wrong" into
+"use this instead".
+
+No schema change. No migration. No loosened constraint.
+
+### Tests: 179 passing, 0 failing
+
+Up from 171. Eight new: the missing-run rejection, the error naming valid
+ids, the fresh-database "(none)" case, a control proving the assertion is
+satisfiable (so the rejection tests are not passing merely because it always
+raises), the real `run-{uuid4hex12}` shape, both `main()` end-to-end paths
+(migration-check-first ordering, and bogus-run rejection through the real
+entry point), and a no-regression test confirming that with a real run row
+the full write path still succeeds and attributes `facts.first_seen_run_id`,
+`facts.last_seen_run_id` and `llm_calls.run_id` to the correct run.

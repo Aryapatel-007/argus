@@ -205,6 +205,64 @@ def assert_migrated(db_path: Path) -> None:
         )
 
 
+def assert_run_exists(db_path: Path, run_id: str) -> None:
+    """Refuse to start unless --run-id names a real row in `runs`.
+
+    THREE tables this server writes carry a foreign key to runs.run_id:
+    llm_calls.run_id (every embedding call), and facts.first_seen_run_id /
+    facts.last_seen_run_id (every fact). None of them can be written for a
+    run that does not exist.
+
+    Checked at STARTUP rather than left to the database, because the FK's own
+    failure mode is genuinely unhelpful: the first remember_fact call dies
+    with a bare "FOREIGN KEY constraint failed" that names no column, no
+    table, and above all does not mention --run-id - which is the actual
+    mistake. Surfaced exactly that way during a real MCP Inspector session
+    (notes/sprint-2.md, Step 10). Failing here instead costs one SELECT and
+    turns a confusing write-time error into a startup message that says what
+    to do.
+
+    This is NOT a workaround for a too-strict schema. The run genuinely must
+    exist first: `loop._on_init` writes the runs row as the very first
+    database operation of any run, before PLAN, before any tool call - so in
+    real orchestrator-spawned operation this invariant already holds by
+    construction and this check never fires. It only catches standalone
+    invocation (Inspector, manual testing) that invented a run id.
+    """
+    with db.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT run_id FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+
+    if row is None:
+        recent = _recent_run_ids(db_path)
+        raise SystemExit(
+            f"{SERVER_NAME}: --run-id {run_id!r} does not exist in the runs "
+            f"table of {db_path}.\n"
+            f"Facts and embedding calls are attributed to a run via a foreign "
+            f"key, so a run that was never started cannot own them.\n"
+            f"Existing run ids (most recent first): "
+            f"{', '.join(recent) if recent else '(none - no runs yet)'}\n"
+            f"Either pass one of those, or create a run first: the orchestrator "
+            f"does this automatically, and notes/inspector-session.md has the "
+            f"exact command for a throwaway run for manual testing."
+        )
+
+
+def _recent_run_ids(db_path: Path, limit: int = 5) -> "list[str]":
+    """A few real run ids, newest first, to put in the error message.
+
+    Naming what IS valid turns "that's wrong" into "use this instead".
+    """
+    with db.connect(db_path) as conn:
+        return [
+            row["run_id"]
+            for row in conn.execute(
+                "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+            )
+        ]
+
+
 # ---------------------------------------------------------------------------
 # hashing
 # ---------------------------------------------------------------------------
@@ -806,7 +864,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
+    # Order matters: schema first, then the run. Checking the run against a
+    # database with no `runs` table would raise OperationalError instead of
+    # the clear migration message assert_migrated exists to give.
     assert_migrated(db_path)
+    assert_run_exists(db_path, args.run_id)
 
     log(f"serving {db_path} for run {args.run_id}")
     build_server(db_path, args.run_id).run(transport="stdio")

@@ -1250,6 +1250,130 @@ class TestStartupAssertion(unittest.TestCase):
         memory.assert_migrated(good)  # must not raise
 
 
+class TestRunIdStartupAssertion(unittest.TestCase):
+    """--run-id must name a real `runs` row, checked BEFORE serving.
+
+    Regression coverage for a bug that 171 automated tests missed and a real
+    MCP Inspector session found in about thirty seconds: every test fixture
+    in this suite inserts a runs row in setUp, so the whole suite only ever
+    exercised the world where the run already exists. Standalone invocation
+    with an invented run id (`--run-id inspector-session-1`) died on the
+    first write with a bare "FOREIGN KEY constraint failed".
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "runcheck.db"
+        apply_migrations(self.db_path)
+
+    def add_run(self, run_id: str, started_at: str = "2026-08-25T00:00:00.000Z") -> None:
+        with db.transaction(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO runs (run_id, target_id, status, started_at) "
+                "VALUES (?, ?, ?, ?)",
+                (run_id, "t", "running", started_at),
+            )
+
+    def test_missing_run_id_exits_before_serving(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            memory.assert_run_exists(self.db_path, "inspector-session-1")
+
+        message = str(caught.exception)
+        self.assertIn("inspector-session-1", message)
+        self.assertIn("--run-id", message)
+        self.assertIn("runs", message)
+
+    def test_error_names_valid_run_ids_when_some_exist(self) -> None:
+        """"That's wrong" is much less useful than "use this instead"."""
+        self.add_run("run-aaaaaaaaaaaa", started_at="2026-08-01T00:00:00.000Z")
+        self.add_run("run-bbbbbbbbbbbb", started_at="2026-08-02T00:00:00.000Z")
+
+        with self.assertRaises(SystemExit) as caught:
+            memory.assert_run_exists(self.db_path, "nope")
+
+        message = str(caught.exception)
+        self.assertIn("run-aaaaaaaaaaaa", message)
+        self.assertIn("run-bbbbbbbbbbbb", message)
+
+    def test_error_says_none_when_no_runs_exist_at_all(self) -> None:
+        """A fresh database should not print a confusing empty list."""
+        with self.assertRaises(SystemExit) as caught:
+            memory.assert_run_exists(self.db_path, "nope")
+
+        self.assertIn("none", str(caught.exception).lower())
+
+    def test_existing_run_id_passes(self) -> None:
+        """Control: proves the assertion can actually be satisfied, so the
+        tests above are not passing merely because it always raises.
+        """
+        self.add_run("run-realrealreal")
+        memory.assert_run_exists(self.db_path, "run-realrealreal")  # must not raise
+
+    def test_orchestrator_generated_run_id_shape_passes(self) -> None:
+        """The real shape, from loop.new_run: f"run-{uuid4().hex[:12]}"."""
+        import uuid
+
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        self.add_run(run_id)
+        memory.assert_run_exists(self.db_path, run_id)  # must not raise
+
+    def test_main_checks_migration_before_run_id(self) -> None:
+        """Order matters: an unmigrated database has no `runs` table at all,
+        so checking the run first would raise OperationalError instead of the
+        clear migration message.
+        """
+        import sqlite3 as _sqlite3
+
+        unmigrated = Path(self._tmp.name) / "unmigrated.db"
+        _sqlite3.connect(unmigrated).close()
+
+        with self.assertRaises(SystemExit) as caught:
+            memory.main([
+                "--db-path", str(unmigrated), "--run-id", "anything",
+            ])
+
+        self.assertIn("schema_migrations", str(caught.exception))
+
+    def test_main_rejects_a_bogus_run_id_on_a_migrated_database(self) -> None:
+        """End to end through main(), the real entry point - not just the
+        helper in isolation. Never reaches build_server or stdio.
+        """
+        with self.assertRaises(SystemExit) as caught:
+            memory.main([
+                "--db-path", str(self.db_path), "--run-id", "inspector-session-1",
+            ])
+
+        self.assertIn("inspector-session-1", str(caught.exception))
+
+
+@requires_ollama
+class TestRememberFactStillWorksWithRealRun(MemoryServerTestCase):
+    """No regression for the orchestrator-spawned case: with a real runs row
+    (which every fixture provides, and which loop._on_init guarantees in real
+    operation), the whole write path works exactly as before.
+    """
+
+    async def test_write_path_succeeds_and_attributes_to_the_real_run(self) -> None:
+        async with Client(self.mcp) as client:
+            result = await self.remember(client)
+
+        self.assertFalse(result.is_error, result.content)
+
+        with db.connect(self.db_path) as conn:
+            fact = conn.execute(
+                "SELECT first_seen_run_id, last_seen_run_id FROM facts"
+            ).fetchone()
+            embed_run = conn.execute(
+                "SELECT run_id FROM llm_calls WHERE role = 'embedder'"
+            ).fetchone()
+
+        # The FK the startup check protects is doing real work: provenance.
+        self.assertEqual(fact["first_seen_run_id"], RUN_ID)
+        self.assertEqual(fact["last_seen_run_id"], RUN_ID)
+        self.assertEqual(embed_run["run_id"], RUN_ID)
+
+
 class TestStdoutDiscipline(MemoryServerTestCase):
     """A stdio MCP server owns stdout. One stray byte corrupts the frame stream.
 

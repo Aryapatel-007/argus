@@ -29,13 +29,43 @@ $env:PYTHONPATH = "D:\Projects\argus\src"
 Confirms it worked: prints `applied 002_facts_approvals.sql` (or
 `no pending migrations` if already applied).
 
+## 0b. One-time: create a throwaway run to attribute writes to
+
+**`--run-id` must name a real row in `runs`.** It is not a free-text label:
+`llm_calls.run_id`, `facts.first_seen_run_id` and `facts.last_seen_run_id`
+all carry a foreign key to `runs.run_id`, so a run that was never started
+cannot own facts or embedding calls. The server checks this at startup and
+refuses to serve otherwise (see Step 10 in `notes/sprint-2.md` — this exact
+mistake, `--run-id inspector-session-1`, is what surfaced the bug).
+
+In real operation the orchestrator creates the run automatically before
+spawning this server, so this step exists only for manual sessions.
+
+List run ids that already exist (any of these can be reused):
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'src'); from argus.storage import db; c=db.connect('data/argus.db').__enter__(); print([r['run_id'] for r in c.execute('SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 10')])"
+```
+
+Or create a fresh throwaway one — uses the same `db.transaction` helper the
+migration runner and orchestrator use, and the same `run-{uuid4hex12}` shape
+`loop.new_run` produces, so it is indistinguishable from a real run row:
+
+```powershell
+$env:PYTHONPATH = "D:\Projects\argus\src"
+.\.venv\Scripts\python.exe -c "import uuid; from argus.storage import db; rid=f'run-{uuid.uuid4().hex[:12]}'; c=db.transaction('data/argus.db').__enter__(); c.execute('INSERT INTO runs (run_id, target_id, status, started_at) VALUES (?,?,?,?)', (rid,'inspector_manual','running','2026-08-25T00:00:00.000Z')); print(rid)"
+```
+
+It prints the new run id — **copy it**, that's what goes in `--run-id` below.
+
 ## 1. Launch Inspector
 
 Verified against the current MCP Inspector docs
-(github.com/modelcontextprotocol/inspector), not assumed from v1:
+(github.com/modelcontextprotocol/inspector), not assumed from v1. Substitute
+the run id from step 0b for `<RUN_ID>`:
 
 ```powershell
-npx @modelcontextprotocol/inspector python src/argus/servers/memory.py -- --db-path data\argus.db --run-id inspector-session-1
+npx @modelcontextprotocol/inspector python src/argus/servers/memory.py -- --db-path data\argus.db --run-id <RUN_ID>
 ```
 
 Notes on this exact command:
@@ -51,8 +81,9 @@ Notes on this exact command:
   are explicit that on the TUI *every* dash-argument meant for the server
   needs it, and the safe default is to always include it. Everything after
   `--` (`--db-path ...  --run-id ...`) goes to `memory.py`, not to Inspector.
-- `--run-id inspector-session-1` is arbitrary — any string works. It only
-  affects which `run_id` embedding calls get attributed to in `llm_calls`.
+- **`--run-id` is NOT arbitrary** — it must be a real `runs.run_id` (step
+  0b). The server exits immediately with a message listing valid ids if it
+  isn't. An invented string like `inspector-session-1` will not work.
 
 If this exact command has drifted from current Inspector behavior, run
 `npx @modelcontextprotocol/inspector --help` to check first — do not assume
@@ -105,3 +136,10 @@ If Inspector itself won't launch (the `npx` command fails before ever
 reaching the tool list), that's an Inspector/Node problem, not a
 `memory.py` problem — check `node --version` (need 22.19.0+, confirmed in
 Step 0) and `npx --version` first.
+
+If the terminal shows `--run-id '...' does not exist in the runs table`
+and the server exits immediately: that is the step-0b check doing its job,
+not a crash. Re-read step 0b and pass a real run id. (A bare
+`FOREIGN KEY constraint failed` on the first `remember_fact` call instead
+would mean the startup check regressed — it should be impossible to reach
+that error via `main()` now.)
