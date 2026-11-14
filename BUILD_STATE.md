@@ -5,8 +5,8 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** B (agent team) — next
-- **Last completed:** Phase A, environment and dependencies
+- **Phase:** C (audit and critical fixes) — next
+- **Last completed:** Phase B, agent team
 - **Test count:** 179 passing (baseline before Phase A: 179). Must never drop.
 - **Blocked:** no
 
@@ -26,11 +26,18 @@ then ARGUS_BUILD.md.
   notes/sprint-2.md. Install-up-front and decide-yourself rules recorded.
 - ARGUS_BUILD.md saved into the repo so later sessions can re-read it.
 
+### Phase B — done (2026-11-14)
+
+- Frontmatter confirmed via claude-code-guide against the docs: `name`,
+  `description` required; `model: opus`, `effort: medium|high|xhigh`,
+  `tools`, `disallowedTools`. Unknown fields are silently ignored.
+- 10 agents in `.claude/agents/`. Usage policy: D-007. Agents defined
+  mid-session may not be listed until the next session starts; if an agent
+  type is missing, run the same prompt through general-purpose and say so.
+
 ## Next steps
 
-1. Phase B: confirm subagent frontmatter format with claude-code-guide, then
-   write `.claude/agents/*.md` (10 agents, Opus, effort medium/high/xhigh).
-2. Phase C: auditor -> notes/audit.md; fix critical/high. Also write up the
+1. Phase C: auditor -> notes/audit.md; fix critical/high. Also write up the
    writer think probe (`notes/writer-probe-raw.json`, untracked until then).
 
 ## Backlog (medium/low, from audits)

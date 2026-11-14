@@ -72,3 +72,18 @@ Phase A.
 **Why:** directive change. Sprints are retired and the phases run back to
 back, so version drift between sprints is no longer the risk it was. Pins in
 requirements.txt keep the environment reproducible.
+
+## D-007 — Agent team: Opus everywhere, effort routed, main session still builds
+
+**Chose:** ten project agents in `.claude/agents/`, all `model: opus`
+(alias resolves to Opus 5.5 on this account per the docs check), `effort`
+fixed per agent at medium, high or xhigh. Field names confirmed against the
+Claude Code subagent docs before writing: `name`, `description`, `tools`,
+`disallowedTools`, `model`, `effort`. Read-only agents (auditor, reviewer,
+skill-scout) drop Write/Edit via `disallowedTools`.
+**Rejected:** delegating every implementation step to `builder`.
+**Why:** each subagent starts cold and re-derives context the main session
+already holds. The independence rules are where delegation pays: audit,
+review of crash-resume/approval/transaction/router diffs, and skill vetting
+go to agents that did not write the code. Implementation that needs the
+whole design in mind stays in the main session.
