@@ -28,11 +28,16 @@ EXPECTED_TABLES = {
     "facts", "facts_vec", "approvals",
     # 003, 004 (Phase C audit fixes H2, H3)
     "run_leases", "remember_receipts",
+    # 005-007 (Phase E graph engine)
+    "graphs", "graph_nodes", "graph_edges", "graph_expansions", "node_events",
+    "node_samples", "routing_decisions", "templates", "template_outcomes",
+    "model_profiles", "co_residency", "arm_stats", "arm_rewards", "model_health",
 }
 EXPECTED_MIGRATIONS = [
     "001_initial.sql", "001b_task_columns.sql", "001c_lock_schema.sql",
     "002_facts_approvals.sql",
     "003_run_leases.sql", "004_remember_receipts.sql",
+    "005_graph.sql", "006_models.sql", "007_llm_calls_graph.sql",
 ]
 
 #: Fixed by nomic-embed-text. Not a tunable — see 002_facts_approvals.sql.
@@ -46,6 +51,8 @@ EXPECTED_LLM_CALLS_COLUMNS = [
     "think_mode", "prompt_file", "prompt_eval_count", "eval_count",
     "eval_duration_ns", "total_duration_ns", "tok_s", "ok", "timed_out",
     "error", "raw_response", "created_at",
+    # Appended by 007 AFTER the 18 locked by 001c, which keep their order.
+    "graph_id", "node_id", "strategy", "sample_index", "decision_id",
 ]
 
 
@@ -651,7 +658,9 @@ class TestLlmCallsEmbedderRole(Migration002TestCase):
                     "AND name NOT LIKE 'sqlite_%'"
                 )
             }
-        self.assertEqual(names, {"idx_llm_calls_run", "idx_llm_calls_task_step"})
+        # The two originals survive every rebuild (002, 007); 007 adds two.
+        self.assertEqual(names, {"idx_llm_calls_run", "idx_llm_calls_task_step",
+                                 "idx_llm_calls_node", "idx_llm_calls_model_time"})
 
     def test_rebuild_preserved_existing_rows(self) -> None:
         """Rows written under the 001c schema must survive the 002 rebuild.

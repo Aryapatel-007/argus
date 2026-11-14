@@ -7,7 +7,7 @@ then ARGUS_BUILD.md.
 
 - **Phase:** E (graph engine), step 1-3 written, not yet committed
 - **Last completed:** Phase D, testing and audit skills
-- **Test count:** 253 at the E1+E3 commit (230 at Phase D) (179 at baseline). Must never drop.
+- **Test count:** 270 at the E2 commit (230 at Phase D) (179 at baseline). Must never drop.
 - **Blocked:** no
 
 ## Phase log
@@ -62,7 +62,7 @@ Spec: `notes/specs/graph-engine.md`. Package `src/argus/graph/`.
 | Step | Status |
 |---|---|
 | 1 node type registry | done (`graph/nodes.py`) |
-| 2 graph model + migration | model written (`graph/model.py`); migrations 005-007 not yet |
+| 2 graph model + migration | done: migrations 005_graph, 006_models, 007_llm_calls_graph; `graph/store.py` (only writer of graph state), `graph/readiness.py` (pure readiness, chains, retries); 17 tests incl. gate-readiness property + negative control |
 | 3 validator + property tests | done: (`graph/validator.py`, `templates.py`, `tests/test_graph_validator.py`, 23 tests incl. 2 negative controls) |
 | 4-12 | not started |
 
@@ -73,10 +73,7 @@ version"). Not upgrading the engine mid-build; question for Arya at the end.
 
 ## Next steps
 
-1. Commit Phase E steps 1+3 (graph nodes, model, templates, validator, tests).
-2. Step 2: migrations 005_graph.sql, 006_models.sql, 007_llm_calls_graph.sql
-   + `graph/store.py`.
-3. Step 4: `config/models.yaml`, `graph/registry.py`,
+1. Step 4: `config/models.yaml`, `graph/registry.py`,
    `scripts/profile_models.py`; run the profiler on the real pool.
 4. Steps 5-12 per ARGUS_BUILD.md 6.10.
 
