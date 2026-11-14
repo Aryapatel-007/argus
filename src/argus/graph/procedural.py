@@ -27,10 +27,15 @@ def template_name(instance: str) -> str:
 
 
 def _succeeded(members: List[Any]) -> bool:
+    """Every chain ended done, or was deliberately skipped (nothing to send,
+    a human said no, budget). Only a chain that FAILED counts against the
+    template: a quiet week is not a broken notify template (review M7)."""
     chains: Dict[str, List[Any]] = defaultdict(list)
     for n in members:
         chains[n.retry_root].append(n)
-    return all(any(m.status == "done" for m in chain) for chain in chains.values())
+    return all(any(m.status in ("done", "skipped") for m in chain) and
+               not all(m.status == "failed" for m in chain)
+               for chain in chains.values())
 
 
 def record_graph(store: Any, graph_id: str) -> None:
@@ -47,7 +52,7 @@ def record_graph(store: Any, graph_id: str) -> None:
         for nd in json.loads(r["spec"]).get("nodes", []):
             if nd.get("template_instance"):
                 replan_instances.add(nd["template_instance"])
-    with db.atomic(store.conn):
+    with store._tx():  # lease-guarded like every other graph write
         for instance, members in by_instance.items():
             name = template_name(instance)
             ok = _succeeded(members)

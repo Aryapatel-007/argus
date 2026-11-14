@@ -4,12 +4,16 @@ Decide whether two facts about "$target_name" describe the SAME thing
 # Known fact
 
 entity_key: $known_key
+<untrusted kind="fact">
 content: $known_content
+</untrusted>
 
 # New fact
 
 entity_key: $new_key
+<untrusted kind="fact">
 content: $new_content
+</untrusted>
 
 # Output
 

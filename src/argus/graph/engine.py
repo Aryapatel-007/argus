@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from argus import config
-from argus.graph import bandit, handlers, readiness, templates
+from argus.graph import bandit, handlers, procedural, readiness, templates, validator
 from argus.graph import nodes as node_types
 from argus.graph.health import HealthMonitor
 from argus.graph.llm import CallResult
@@ -121,7 +121,11 @@ class Engine:
             else:
                 initial = GraphSpec.build([NodeSpec(
                     node_id=new_node_id("plan"), node_type="plan",
-                    params={"fields": list(target.get("extract") or [])}, prunable=False)], [])
+                    params={"fields": list(target.get("extract") or []),
+                            # stored with the node, so a resumed plan sees the
+                            # same hints it was created with
+                            "hints": procedural.hints_for(conn, target["id"])},
+                    prunable=False)], [])
             ok, violations = store.apply_expansion(graph_id, initial, kind="initial",
                                                    counts_toward_limit=False)
             if not ok:
@@ -137,6 +141,10 @@ class Engine:
         with db.connect(self.db_path) as conn:
             base = GraphStore(conn)
             g = base.graph(graph_id)
+            # Leases are released when a graph finishes or waits, so (re)take
+            # it here; a live owner elsewhere makes this refuse.
+            if not lease.acquire(conn, g.run_id, self.owner):
+                raise lease.LeaseLost(f"run {g.run_id} is owned by a live process")
             store = GraphStore(conn, run_id=g.run_id, lease_owner=self.owner)
             return await self._drive(store, g)
 
@@ -156,7 +164,7 @@ class Engine:
     async def _drive(self, store: GraphStore, g) -> RunOutcome:
         target = g.config.get("target") or {"id": g.target_id}
         router = Router(store.conn, self.models, self.mode, self.cfg, self.baseline)
-        health = HealthMonitor(store.conn, self.cfg.get("health", {}))
+        health = router.health  # one monitor: trial grants and results meet here
         state = self._routing_state(store, g.graph_id)
         if store.graph(g.graph_id).status == "waiting_approval":
             store.set_graph_status(g.graph_id, "running")
@@ -169,9 +177,14 @@ class Engine:
 
         def on_model_used(model: str, result: CallResult) -> None:
             self.resident = {model} | {m for m in self.resident if "embed" in m}
-            health.record(model, tok_s=result.tok_s, timed_out=result.timed_out, ok=result.ok)
+            health.record(model, tok_s=result.tok_s, timed_out=result.timed_out, ok=result.ok,
+                          responded=result.raw is not None)
 
         while True:
+            # Yield every iteration: a loop that only writes and `continue`s
+            # would otherwise starve every task and every timeout (review
+            # High 1 could not even be cancelled).
+            await asyncio.sleep(0)
             now = self.clock()
             store.add_usage(g.graph_id, seconds=now - last_tick)  # also heartbeats the lease
             last_tick = now
@@ -211,9 +224,17 @@ class Engine:
                         outcome = "failed"  # stuck: should be unreachable; never spin
                     else:
                         continue
-                store.set_graph_status(g.graph_id, outcome)
-                self._record_templates(store, g.graph_id)
-                return self._outcome(store, g, outcome)
+                if outcome in ("done", "failed"):
+                    # Idempotent (one row per instance), so recording before
+                    # the finish cannot double count after a crash; recording
+                    # at waiting_approval would freeze notify as failed.
+                    self._record_templates(store, g.graph_id)
+                store.finish_graph(g.graph_id, outcome)
+                result = self._outcome(store, g, outcome)
+                # Nobody drives a finished or waiting graph: free the run so a
+                # later engine (same process or not) can resume it (review M3).
+                lease.release(store.conn, g.run_id, self.owner)
+                return result
 
             done, _ = await asyncio.wait(list(tasks), return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -247,21 +268,36 @@ class Engine:
         """Steps 2-6. True if anything was written (caller reloads)."""
         changed = False
         # 2. retries (state-derived, deterministic ids)
+        # A retry the validator rejected (node or depth limit) is FINAL: it is
+        # recorded once and never re-offered, or this loop would spin forever
+        # without awaiting (review High 1). The failed chain then ends dead.
+        rejected = {r["expansion_id"] for r in store.conn.execute(
+            "SELECT expansion_id FROM graph_expansions WHERE graph_id = ? AND accepted = 0",
+            (g.graph_id,))}
         for exp_id, spec in readiness.plan_retries(nodes, edges, g.limits):
-            store.apply_expansion(g.graph_id, spec, kind="retry", expansion_id=exp_id,
-                                  counts_toward_limit=False, allow_existing_dst=True)
-            changed = True
+            if exp_id in rejected:
+                continue
+            ok, _ = store.apply_expansion(g.graph_id, spec, kind="retry", expansion_id=exp_id,
+                                          counts_toward_limit=False, allow_existing_dst=True)
+            changed = True  # either nodes were added or a rejection was recorded
         # 3. triggers -> replan nodes
         for n in nodes.values():
             if n.status == "done" and (n.output or {}).get("trigger"):
                 rid = f"replan-{n.node_id}"
                 if rid in nodes or g.expansions_used >= g.limits.max_expansions:
                     continue
+                if n.node_type == "extract" and not any(
+                        e.src == n.node_id and e.channel == "subject" and nodes[e.dst].status == "done"
+                        for e in edges if e.dst in nodes):
+                    continue  # never replan from facts the critic has not accepted
                 spec = GraphSpec.build(
                     [NodeSpec(node_id=rid, node_type="replan",
                               params={"fields": n.output["trigger"].get("missing_fields", [])})],
                     [EdgeSpec(n.node_id, rid, "trigger")])
-                ok, _ = store.apply_expansion(g.graph_id, spec, kind="engine", expansion_id=f"exp-{rid}",
+                # "trigger-" prefix: "exp-<node_id>" is reserved for a planner
+                # node's OWN output expansion. Sharing it made the replan's
+                # expansion look already applied and stranded the node.
+                ok, _ = store.apply_expansion(g.graph_id, spec, kind="engine", expansion_id=f"trigger-{rid}",
                                               counts_toward_limit=False)
                 changed = changed or ok
         # 4. blocked gates
@@ -309,10 +345,15 @@ class Engine:
             return set()
         out = set()
         for e in edges:
-            if e.dst == n.node_id and e.channel == "subject":
-                d = store.live_decision(e.src)
-                if d:
-                    out.update(d["models"])
+            if e.dst == n.node_id and e.channel == "subject" and e.src in nodes:
+                src = nodes[e.src]
+                produced = (src.output or {}).get("_produced_by") if src.status == "done" else None
+                if produced:
+                    out.add(produced)
+                else:
+                    d = store.live_decision(e.src)
+                    if d:
+                        out.update(d["models"])
         return out
 
     def _route(self, store, router, state, g, n, nodes, edges) -> None:
@@ -389,8 +430,13 @@ class Engine:
         node = store.node(node_id)
         if r.tokens:
             store.add_usage(g.graph_id, tokens=r.tokens)
+        # Rewards ride in the SAME transaction as the node's result (review M6):
+        # a crash can lose neither one without the other.
+        reward_ops = self._reward_ops(store, node, r)
+        notes = {"notes": r.notes} if r.notes else None
         if node.node_type in ("plan", "replan") and r.status == "done":
             self._apply_plan(store, g, target, node, r.output or {})
+            self._apply_ops(store, reward_ops)
         elif node.node_type == "plan" and r.status == "failed":
             # The planner never sinks a run: fall back to the target's own
             # page and fields (deterministic), and say so in the output.
@@ -398,42 +444,65 @@ class Engine:
                         "steps": [{"template": "check_page",
                                    "params": {"url": target.get("url"), "fields": list(target.get("extract") or [])}}]}
             self._apply_plan(store, g, target, node, {"plan": fallback, "fallback": True, "planner_error": r.error})
+            self._apply_ops(store, reward_ops)
         elif node.node_type == "replan" and r.status == "failed":
-            store.transition(node_id, "done", expect=("running",),
+            store.transition(node_id, "done", expect=("running",), extra_ops=reward_ops,
                              output={"plan": {"thought": "replan failed", "steps": []}, "error": r.error})
         elif r.status == "done":
             store.transition(node_id, "done", expect=("running",), output=r.output or {},
-                             detail={"notes": r.notes} if r.notes else None, extra_ops=r.extra_ops)
+                             detail=notes, extra_ops=list(r.extra_ops) + reward_ops)
         elif r.status == "blocked":
-            store.transition(node_id, "blocked", expect=("running",), extra_ops=r.extra_ops,
-                             detail={"notes": r.notes} if r.notes else None)
+            store.transition(node_id, "blocked", expect=("running",), extra_ops=list(r.extra_ops) + reward_ops,
+                             detail=notes)
         elif r.status == "skipped":
-            store.transition(node_id, "skipped", expect=("running",), skip_reason=r.skip_reason)
+            store.transition(node_id, "skipped", expect=("running",), skip_reason=r.skip_reason,
+                             extra_ops=reward_ops)
         else:
             store.transition(node_id, "failed", expect=("running",), output=r.output, error=r.error,
-                             detail={"notes": r.notes} if r.notes else None)
-        self._apply_rewards(store, node, r)
+                             detail=notes, extra_ops=reward_ops)
 
-    def _apply_rewards(self, store, node, r) -> None:
+    @staticmethod
+    def _apply_ops(store, ops) -> None:
+        if ops:
+            with store._tx():
+                for sql, params in ops:
+                    store.conn.execute(sql, params)
+
+    def _prior(self, store, model: str, node_type: str) -> float:
+        from argus.graph import registry
+
+        v = registry.profile(store.conn, model, node_type, "quality")
+        return float(v if v is not None else self.cfg.get("defaults", {}).get("quality", 0.5))
+
+    def _reward_ops(self, store, node, r) -> list:
+        """Rewards for this node's result, as ops. Arms are always seeded from
+        the profiler prior, in every mode, so fixed-mode evidence warms the
+        same posterior learning mode reads (review M6). Baseline records none:
+        it is the no-learning control."""
         if self.mode == "baseline":
-            return
+            return []
         strength = float(self.cfg.get("prior_strength", 6))
-        for node_type, model, source, reward, detail in r.rewards:
-            bandit.apply_reward(store.conn, node_type=node_type, model=model, node_id=node.node_id,
-                                source=source, reward=reward, detail=detail, strength=strength)
+        ops = []
+        for node_type, model, source, reward, detail, suffix in r.rewards:
+            ops += bandit.reward_ops(node_type=node_type, model=model, reward_key=node.node_id + suffix,
+                                     source=source, reward=reward, detail=detail,
+                                     prior_quality=self._prior(store, model, node_type), strength=strength)
         if node.node_type == "critique" and r.output and r.output.get("verdict"):
-            # Critic reward for the SUBJECT's model, only when a different model
-            # judged it: a model never grades itself.
-            critic = store.live_decision(node.node_id)
+            # Critic reward goes to the model that AUTHORED the judged output,
+            # and only when a different model judged it: a model never grades
+            # itself.
+            critic_model = r.output.get("_produced_by")
             for e in store.edges(node.graph_id):
                 if e.dst == node.node_id and e.channel == "subject":
-                    subj = store.live_decision(e.src)
-                    if subj and critic and subj["model_tag"] not in critic["models"]:
-                        bandit.apply_reward(
-                            store.conn, node_type=store.node(e.src).node_type, model=subj["model_tag"],
-                            node_id=e.src, source="critic",
+                    subj = store.node(e.src)
+                    author = (subj.output or {}).get("_produced_by")
+                    if author and critic_model and author != critic_model:
+                        ops += bandit.reward_ops(
+                            node_type=subj.node_type, model=author, reward_key=e.src, source="critic",
                             reward=1.0 if r.output["verdict"].get("verdict") == "pass" else 0.0,
-                            detail=f"judged by {critic['model_tag']}", strength=strength)
+                            detail=f"judged by {critic_model}",
+                            prior_quality=self._prior(store, author, subj.node_type), strength=strength)
+        return ops
 
     def _apply_plan(self, store, g, target, node, output) -> None:
         plan = output.get("plan") or {}
@@ -479,21 +548,27 @@ class Engine:
         elif summarize and changes_from and summarize[0].status == "pending":
             for c in changes_from:
                 spec.edges.append(EdgeSpec(c, summarize[0].node_id, "changes"))
-        out = {**output, "dropped_steps": dropped}
-        ok, violations = store.apply_expansion(
-            g.graph_id, spec, kind=node.node_type, requested_by=node.node_id,
-            expansion_id=f"exp-{node.node_id}", counts_toward_limit=node.node_type == "replan",
-            complete_node=(node.node_id, out))
-        if not ok and node.node_type == "plan":
-            # Never leave a run with nothing to do: deterministic fallback graph.
+        counts = node.node_type == "replan"
+        g_now = store.graph(g.graph_id)
+        violations = validator.validate_expansion(
+            store.spec(g.graph_id), spec, g_now.limits, g_now.expansions_used + (1 if counts else 0))
+        if violations and node.node_type == "plan":
+            # Swap in the deterministic fallback BEFORE writing, so the plan's
+            # output and the graph it produced land in ONE transaction (review
+            # M4: two transactions could leave a done plan with nothing to run).
+            dropped.append("planned graph rejected: " + "; ".join(str(v) for v in violations[:5]))
             fb, ex = templates.instantiate("check_page", g.graph_id, target["id"], {
                 "url": target.get("url"), "fields": list(target.get("extract") or [])})
             dig, dex = templates.instantiate("digest", g.graph_id, target["id"], {"changes_from": [ex["changes"]]})
-            fb = fb.merged(dig)
+            spec = fb.merged(dig)
             if target.get("notify"):
-                fb = fb.merged(templates.instantiate("notify", g.graph_id, target["id"], {"digest_from": dex["digest"]})[0])
-            store.apply_expansion(g.graph_id, fb, kind="engine", requested_by=node.node_id,
-                                  expansion_id=f"fallback-{node.node_id}", counts_toward_limit=False)
+                spec = spec.merged(templates.instantiate("notify", g.graph_id, target["id"],
+                                                         {"digest_from": dex["digest"]})[0])
+        out = {**output, "dropped_steps": dropped}
+        store.apply_expansion(
+            g.graph_id, spec, kind=node.node_type, requested_by=node.node_id,
+            expansion_id=f"exp-{node.node_id}", counts_toward_limit=counts,
+            complete_node=(node.node_id, out))
 
     def _record_templates(self, store, graph_id) -> None:
         from argus.graph import procedural
@@ -509,11 +584,4 @@ class Engine:
         for n in nodes.values():
             if n.node_type == "summarize" and n.status == "done":
                 digest = (n.output or {}).get("digest", {}).get("digest")
-        if status in ("done", "failed"):
-            with db.atomic(store.conn):
-                store.conn.execute(
-                    "UPDATE runs SET status = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                    "WHERE run_id = ? AND NOT EXISTS (SELECT 1 FROM graphs WHERE run_id = ? "
-                    "AND status IN ('running', 'waiting_approval'))",
-                    (status, g.run_id, g.run_id))
         return RunOutcome(g.run_id, g.graph_id, status, digest, counts)

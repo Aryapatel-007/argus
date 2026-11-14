@@ -44,6 +44,12 @@ cascade:
   types: [extract, summarize]
   adequate_quality: 0.7
 
+# resolve_entity and diff thresholds (D-016, D-020).
+resolve:
+  embed_same: 0.85        # recall relevance at or above: same entity
+  embed_maybe: 0.60       # between maybe and same: ask a model
+  unchanged_overlap: 0.85 # stored fact still on the page -> unchanged
+
 health:
   degrade_ratio: 0.35       # tok/s below 35% of profiled tok/s is "slow"
   strikes: 2                # consecutive slow calls or timeouts to degrade

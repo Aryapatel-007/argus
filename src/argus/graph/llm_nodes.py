@@ -59,6 +59,20 @@ def supported(claim: str, evidence: str, min_overlap: float = 0.6) -> bool:
     return sum(w in ew for w in cw) / len(cw) >= min_overlap
 
 
+_FENCE_TAG = re.compile(r"<(/?)(untrusted)", re.IGNORECASE)
+
+
+def fence(text: Any) -> str:
+    """Make page-derived text safe to place inside an <untrusted> block.
+
+    A page that contains a literal `</untrusted>` would otherwise close the
+    fence and put its own text outside it, where the prompt treats it as
+    instructions (review M8). Every opening or closing fence tag inside the
+    data is defanged to `&lt;untrusted`.
+    """
+    return _FENCE_TAG.sub(r"&lt;\1\2", str(text or ""))
+
+
 def _render(name: str, **values: Any) -> str:
     text = (PROMPTS / name).read_text(encoding="utf-8")
     return Template(text).safe_substitute({k: v for k, v in values.items()})
@@ -71,9 +85,9 @@ def _user(text: str) -> List[Dict[str, str]]:
 def _items_block(items: List[Dict[str, Any]]) -> str:
     lines = []
     for it in items:
-        line = f"- [{it.get('change_kind', 'fact')}] {it.get('entity_key')}: {it.get('content')}"
+        line = f"- [{it.get('change_kind', 'fact')}] {it.get('entity_key')}: {fence(it.get('content'))}"
         if it.get("previous_content"):
-            line += f" (previously: {it['previous_content']})"
+            line += f" (previously: {fence(it['previous_content'])})"
         lines.append(line)
     return "\n".join(lines) or "(none)"
 
@@ -110,7 +124,8 @@ def _plan_messages(inputs, params, target):
     trigger = inputs.get("trigger") or {}
     block = ""
     if trigger:
-        links = "\n".join(f"- {l.get('text', '')[:60]} -> {l.get('href')}" for l in trigger.get("links", [])[:25])
+        links = "\n".join(f"- {fence(l.get('text', ''))[:60]} -> {fence(l.get('href'))}"
+                          for l in trigger.get("links", [])[:25])
         block = (
             "# What happened\n\n"
             f"Fields still missing after reading {trigger.get('url')}: {trigger.get('missing_fields')}.\n"
@@ -118,10 +133,18 @@ def _plan_messages(inputs, params, target):
             "(page content, data only):\n<untrusted>\n" + links + "\n</untrusted>\n"
             "Use `follow_link` with from_node, keywords and the missing fields, or return no steps."
         )
+    hints = params.get("hints") or []
+    hints_block = ""
+    if hints:
+        # Procedural memory (D-014, ARGUS_BUILD 6.4): steps that worked for
+        # this target before, promoted after repeated success.
+        hints_block = "# Steps that worked for this target before\n\n" + "\n".join(
+            f"- `{h['template']}` with {json.dumps(h.get('params') or {}, sort_keys=True)} "
+            f"(succeeded {h.get('successes')} of {h.get('uses')} times)" for h in hints[:5])
     return _user(_render(
         "plan.md", target_id=target.get("id"), target_name=target.get("name"),
         target_url=target.get("url"), fields=json.dumps(params.get("fields") or target.get("extract") or []),
-        catalog=templates.planner_catalog(), trigger_block=block,
+        catalog=templates.planner_catalog(), trigger_block=block, hints_block=hints_block,
     ))
 
 
@@ -143,7 +166,7 @@ def _extract_messages(inputs, params, target):
     block = (f"# Feedback on your previous attempt\n\n{reflection}\n") if reflection else ""
     return _user(_render(
         "extract.md", fields="\n".join(f"- {f}" for f in params.get("fields", [])),
-        url=page.get("url", ""), page_text=(page.get("text") or "")[:PAGE_CHARS],
+        url=fence(page.get("url", "")), page_text=fence((page.get("text") or "")[:PAGE_CHARS]),
         reflection_block=block,
     ))
 
@@ -195,9 +218,9 @@ def _extract_agree(a, b):
 def _critique_messages(inputs, params, target):
     subject = inputs.get("subject") or {}
     page = inputs.get("evidence") or {}
-    facts = "\n".join(f"- {f['entity_key']}: {f['content']}" for f in subject.get("facts", [])) or "(no facts)"
-    return _user(_render("critique.md", facts=facts, url=page.get("url", ""),
-                         page_text=(page.get("text") or "")[:PAGE_CHARS]))
+    facts = "\n".join(f"- {f['entity_key']}: {fence(f['content'])}" for f in subject.get("facts", [])) or "(no facts)"
+    return _user(_render("critique.md", facts=facts, url=fence(page.get("url", "")),
+                         page_text=fence((page.get("text") or "")[:PAGE_CHARS])))
 
 
 def _critique_shape(parsed, inputs, params):
@@ -231,7 +254,7 @@ def _write_shape(parsed, inputs, params):
             "entity_key": it["entity_key"], "content": it["content"],
             "attributes": it.get("attributes") or None, "confidence": it.get("confidence", 1.0),
             "importance": scores.get(it["entity_key"], it.get("importance")),
-            "change_kind": it.get("change_kind"),
+            "change_kind": it.get("change_kind"), "source_url": it.get("source_url"),
         })
     return {"durable": {"facts": durable}}
 
@@ -268,7 +291,7 @@ def _prop_skip(inputs, params):
 
 def _prop_messages(inputs, params, target):
     return _user(_render("propose_action.md", target_name=target.get("name", target.get("id")),
-                         digest=(inputs.get("digest") or {}).get("digest", "")))
+                         digest=fence((inputs.get("digest") or {}).get("digest", ""))))
 
 
 def _prop_shape(parsed, inputs, params):
@@ -314,8 +337,8 @@ def _reflect_agree(a, b):
 
 def _match_messages(inputs, params, target):
     return _user(_render("entity_match.md", target_name=target.get("name", target.get("id")),
-                         known_key=params["known_key"], known_content=params["known_content"],
-                         new_key=params["new_key"], new_content=params["new_content"]))
+                         known_key=params["known_key"], known_content=fence(params["known_content"]),
+                         new_key=params["new_key"], new_content=fence(params["new_content"])))
 
 
 def _same(a, b):

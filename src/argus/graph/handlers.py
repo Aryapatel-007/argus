@@ -38,8 +38,9 @@ class NodeResult:
     skip_reason: Optional[str] = None
     tokens: int = 0
     extra_ops: List[Op] = field(default_factory=list)
-    #: (node_type, model, source, reward, detail)
-    rewards: List[Tuple[str, str, str, float, str]] = field(default_factory=list)
+    #: (node_type, model, source, reward, detail, key_suffix). The suffix keeps
+    #: rewards for different samples of one node distinct (e.g. "#2").
+    rewards: List[Tuple[str, str, str, float, str, str]] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
 
 
@@ -72,7 +73,7 @@ def _validator_rewards(node_type: str, res) -> List[Tuple[str, str, str, float, 
         if a.reused:
             continue
         out.append((node_type, a.model, "validator", 1.0 if a.valid else 0.0,
-                    "; ".join(a.problems)[:300] if a.problems else "valid"))
+                    "; ".join(a.problems)[:300] if a.problems else "valid", f"#{a.index}"))
     return out
 
 
@@ -92,6 +93,10 @@ async def _llm(ex: Any) -> NodeResult:
         return NodeResult("failed", error=res.error or "model output rejected", tokens=res.tokens,
                           rewards=rewards, notes=res.notes)
     shaped = spec.shape(res.parsed, ex.inputs, ex.params)
+    # Which model wrote the accepted answer. The critic independence rule and
+    # the critic reward use THIS, not every model the decision named (a
+    # cascade names two but only one authored the output; review High 2).
+    shaped["_produced_by"] = res.model
     if t == "critique" and res.parsed.get("verdict") == "fail":
         return NodeResult("failed", output=shaped, tokens=res.tokens, rewards=rewards,
                           error=f"critic rejected: {res.parsed.get('reflection', '')}"[:800],
@@ -105,8 +110,19 @@ async def _llm(ex: Any) -> NodeResult:
 # resolve_entity: normalized key -> embedding similarity -> model check
 # ---------------------------------------------------------------------------
 
-EMBED_SAME = 0.85
-EMBED_MAYBE = 0.60
+def _resolve_cfg(ex: Any) -> Dict[str, float]:
+    cfg = (getattr(ex, "routing_cfg", None) or {}).get("resolve", {})
+    return {"same": float(cfg.get("embed_same", 0.85)), "maybe": float(cfg.get("embed_maybe", 0.60)),
+            "unchanged_overlap": float(cfg.get("unchanged_overlap", 0.85))}
+
+
+def _pair_index(a: str, b: str) -> int:
+    """Sample index derived from the PAIR being compared, so a resumed node
+    that sees a different top candidate cannot reuse an answer about another
+    pair (review low)."""
+    import hashlib
+
+    return 100 + int(hashlib.sha256(f"{a}\x00{b}".encode()).hexdigest()[:8], 16) % 1_000_000
 
 
 async def _resolve(ex: Any) -> NodeResult:
@@ -117,6 +133,7 @@ async def _resolve(ex: Any) -> NodeResult:
     claimed = set()
     out, tokens, rewards = [], 0, []
     spec = llm_nodes.node("entity_match")
+    th = _resolve_cfg(ex)
     for i, fact in enumerate(facts):
         key = fact["entity_key"]
         nk = nt.normalize_key(key)
@@ -131,15 +148,18 @@ async def _resolve(ex: Any) -> NodeResult:
                     and not str(h["entity_key"]).startswith("summary:")]
             top = hits[0] if hits else None
             rel = float(top["relevance"]) if top else 0.0
-            if top and rel >= EMBED_SAME:
+            if top and rel >= th["same"]:
                 path, resolved, detail = "embedding", top["entity_key"], {"relevance": rel}
-            elif top and rel >= EMBED_MAYBE and ex.decision is not None:
+            elif top and rel >= th["maybe"] and ex.decision is not None:
                 params = {"known_key": top["entity_key"], "known_content": top["content"],
                           "new_key": key, "new_content": fact["content"]}
                 runner = StrategyRunner(ex=ex, spec=spec, decision=ex.decision)
-                a = await runner.call(100 + i, ex.decision["model_tag"], inputs={}, params=params)
+                a = await runner.call(_pair_index(top["entity_key"] + "|" + top["content"],
+                                                  key + "|" + fact["content"]),
+                                      ex.decision["model_tag"], inputs={}, params=params)
                 tokens += a.eval_count
-                rewards.append(("resolve_entity", a.model, "validator", 1.0 if a.valid else 0.0, "entity_match"))
+                rewards.append(("resolve_entity", a.model, "validator", 1.0 if a.valid else 0.0,
+                                "entity_match", f"#{a.index}"))
                 same = bool(a.valid and a.parsed.get("same_entity"))
                 path = "model"
                 detail = {"relevance": rel, "same_entity": same, "model": a.model}
@@ -165,17 +185,22 @@ async def _diff(ex: Any) -> NodeResult:
     memory_items = {m["entity_key"]: m for m in ((ex.inputs.get("memory") or {}).get("items")) or []}
     text = ((ex.inputs.get("evidence") or {}).get("text")) or ""
     fields = list(ex.params.get("fields") or [])
+    page = ex.inputs.get("evidence") or {}
+    # The page actually read, not a template param: a page reached by
+    # follow_link has no url in its params (it came from a search node).
+    source_url = page.get("final_url") or page.get("url") or ex.params.get("source_url")
     items, seen = [], set()
     for r in resolved:
         key = r["entity_key"]
         seen.add(key)
         stored = memory_items.get(key)
         base = {"entity_key": key, "attributes": r.get("attributes") or None,
-                "confidence": r.get("confidence", 1.0), "resolution": r.get("resolution")}
+                "confidence": r.get("confidence", 1.0), "resolution": r.get("resolution"),
+                "source_url": source_url}
         if stored is None:
             items.append({**base, "content": r["content"], "change_kind": "added"})
         elif (llm_nodes.norm_space(stored["content"]) == llm_nodes.norm_space(r["content"])
-              or llm_nodes.supported(stored["content"], text, min_overlap=0.85)):
+              or llm_nodes.supported(stored["content"], text, min_overlap=_resolve_cfg(ex)["unchanged_overlap"])):
             items.append({**base, "content": stored["content"], "change_kind": "unchanged",
                           "attributes": stored.get("attributes"), "importance": stored.get("importance")})
         else:
@@ -185,14 +210,14 @@ async def _diff(ex: Any) -> NodeResult:
         if key in seen or key not in memory_items:
             continue
         stored = memory_items[key]
-        if llm_nodes.supported(stored["content"], text, min_overlap=0.85):
+        if llm_nodes.supported(stored["content"], text, min_overlap=_resolve_cfg(ex)["unchanged_overlap"]):
             items.append({"entity_key": key, "content": stored["content"], "change_kind": "unchanged",
                           "attributes": stored.get("attributes"), "importance": stored.get("importance"),
                           "resolution": "still_on_page"})
         else:
             items.append({"entity_key": key, "content": stored["content"], "change_kind": "missing"})
     return NodeResult("done", output={"changes": {
-        "target_id": ex.target["id"], "source_url": ex.params.get("source_url"), "items": items}})
+        "target_id": ex.target["id"], "source_url": source_url, "items": items}})
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +236,8 @@ async def _remember(ex: Any) -> NodeResult:
     for f in facts:
         r = await ex.services.memory.remember(
             target_id=ex.target["id"], entity_key=f["entity_key"], content=f["content"],
-            attributes=f.get("attributes") or None, source_url=ex.params.get("source_url"),
+            attributes=f.get("attributes") or None,
+            source_url=f.get("source_url") or ex.params.get("source_url") or None,
             confidence=float(f.get("confidence") if f.get("confidence") is not None else 1.0),
             importance=f.get("importance"),
             # Same node + same entity -> same key: a resumed remember returns the
@@ -223,10 +249,18 @@ async def _remember(ex: Any) -> NodeResult:
 
 
 def same_site(url: str, base: str) -> bool:
+    """Same host (ignoring a leading www.) AND same port. Fails closed: no
+    base url, no match (review low: a missing target url used to make every
+    url "same site")."""
+    if not url or not base:
+        return False
     a, b = urlparse(url), urlparse(base)
     ha, hb = (a.hostname or "").lower(), (b.hostname or "").lower()
     strip = lambda h: h[4:] if h.startswith("www.") else h  # noqa: E731
-    return a.scheme in ("http", "https") and strip(ha) == strip(hb)
+    default = {"http": 80, "https": 443}
+    pa = a.port or default.get(a.scheme)
+    pb = b.port or default.get(b.scheme)
+    return a.scheme in ("http", "https") and bool(ha) and strip(ha) == strip(hb) and pa == pb
 
 
 async def _fetch(ex: Any) -> NodeResult:
@@ -234,7 +268,7 @@ async def _fetch(ex: Any) -> NodeResult:
     url = urls[0] if urls else ex.params.get("url")
     if not url:
         return NodeResult("failed", error="no url to fetch")
-    if not same_site(url, ex.target.get("url", url)):
+    if not same_site(url, ex.target.get("url", "")):
         return NodeResult("failed", error=f"refusing off-site url {url!r} for target {ex.target['id']}")
     page = await ex.services.browser.open_page(url)
     if not page.get("ok") or not (page.get("text") or "").strip():
@@ -249,7 +283,7 @@ async def _search(ex: Any) -> NodeResult:
     best, best_score = None, 0
     for link in page.get("links", []):
         href = urljoin(page.get("final_url") or page.get("url") or "", link.get("href", ""))
-        if not same_site(href, ex.target.get("url", href)):
+        if not same_site(href, ex.target.get("url", "")):
             continue
         hay = f"{link.get('text', '')} {href}".lower()
         score = sum(k in hay for k in keywords)
@@ -282,22 +316,43 @@ async def _gate(ex: Any) -> NodeResult:
 
 
 async def _execute(ex: Any) -> NodeResult:
+    """Claim, then act, then record (review M10).
+
+    1. CLAIM, one transaction: flip the row approved -> executed with
+       result {"claimed_by": this node}. From here a human can no longer
+       reject it, and nobody else can claim it. A row in any other state is
+       refused: readiness should make that unreachable; this is the third
+       independent check (D-019).
+    2. ACT: the executor is idempotent by key (outbox file named by it).
+    3. RECORD: the final result, in the same transaction as the node's done.
+    A crash after 1 resumes here, sees its own claim, and finishes; a crash
+    after 2 finds the file and does not send twice.
+    """
     approval = ex.inputs.get("approval") or {}
     key = approval.get("idempotency_key")
-    row = ex.store.conn.execute(
-        "SELECT status, action_kind, proposed_action FROM approvals WHERE idempotency_key = ?", (key,)
-    ).fetchone() if key else None
-    if row is None or row["status"] != "approved":
-        # Readiness should make this unreachable; this is the third check.
-        return NodeResult("failed", error=f"approval {key!r} is {row['status'] if row else 'missing'}, not approved")
+    me = ex.node.node_id
+    with ex.store._tx():
+        row = ex.store.conn.execute(
+            "SELECT status, action_kind, proposed_action, result FROM approvals WHERE idempotency_key = ?",
+            (key,)).fetchone() if key else None
+        if row is None:
+            return NodeResult("failed", error=f"approval {key!r} is missing, not approved")
+        claim = json.loads(row["result"] or "{}") if row["status"] == "executed" else {}
+        if row["status"] == "approved":
+            ex.store.conn.execute(
+                "UPDATE approvals SET status = 'executed', "
+                "executed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), executed_run_id = ?, result = ? "
+                "WHERE idempotency_key = ? AND status = 'approved'",
+                (ex.run_id, json.dumps({"claimed_by": me, "state": "claimed"}), key))
+        elif not (row["status"] == "executed" and claim.get("claimed_by") == me):
+            return NodeResult("failed", error=f"approval {key!r} is {row['status']}, not approved")
     payload = json.loads(row["proposed_action"])
     try:
         result = ex.services.actions.execute(row["action_kind"], payload, key)
     except Exception as exc:  # noqa: BLE001
-        return NodeResult("failed", error=f"action failed: {exc!r}")
+        return NodeResult("failed", error=f"action failed after claim: {exc!r}")
     op = (
-        "UPDATE approvals SET status = 'executed', executed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), "
-        "executed_run_id = ?, result = ? WHERE idempotency_key = ? AND status = 'approved'",
-        (ex.run_id, json.dumps(result, sort_keys=True), key),
+        "UPDATE approvals SET result = ? WHERE idempotency_key = ? AND status = 'executed'",
+        (json.dumps({"claimed_by": me, "state": "done", **result}, sort_keys=True), key),
     )
     return NodeResult("done", output={"result": result}, extra_ops=[op])

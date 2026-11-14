@@ -54,6 +54,27 @@ def sample(alpha: float, beta: float, rng: random.Random) -> float:
     return rng.betavariate(alpha, beta)
 
 
+def reward_ops(*, node_type: str, model: str, reward_key: str, source: str, reward: float,
+               detail: Optional[str], prior_quality: float, strength: float):
+    """The three statements that apply one reward, for the CALLER's
+    transaction (so a node's result and its rewards commit together; review
+    M6). Idempotent: the arm update fires only when the reward row was new,
+    via SQLite's changes() for the immediately preceding INSERT."""
+    reward = min(max(float(reward), 0.0), 1.0)
+    alpha, beta = seed_params(prior_quality, strength)
+    return [
+        ("INSERT INTO arm_stats (node_type, model_tag, alpha, beta) VALUES (?, ?, ?, ?) "
+         "ON CONFLICT (node_type, model_tag) DO NOTHING", (node_type, model, alpha, beta)),
+        ("INSERT INTO arm_rewards (node_type, model_tag, node_id, source, reward, detail) "
+         "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (node_id, model_tag, source) DO NOTHING",
+         (node_type, model, reward_key, source, reward, detail)),
+        ("UPDATE arm_stats SET alpha = alpha + ?, beta = beta + ?, pulls = pulls + 1, "
+         "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+         "WHERE node_type = ? AND model_tag = ? AND changes() = 1",
+         (reward, 1.0 - reward, node_type, model)),
+    ]
+
+
 def apply_reward(conn: sqlite3.Connection, *, node_type: str, model: str, node_id: str,
                  source: str, reward: float, detail: Optional[str] = None,
                  prior_quality: float = 0.5, strength: float = 6.0) -> bool:

@@ -31,6 +31,30 @@ KEYWORDS = {
 }
 
 
+def unit_vector(text: str, dims: int = 768) -> List[float]:
+    """Deterministic unit vector for `text` (sha256-seeded). Same text, same
+    vector; different texts land far apart. Stands in for nomic-embed-text."""
+    import hashlib
+    import math
+
+    raw = hashlib.sha256(text.encode("utf-8")).digest() * (dims // 32 + 1)
+    vec = [(b - 127.5) for b in raw[:dims]]
+    norm = math.sqrt(sum(v * v for v in vec))
+    return [v / norm for v in vec]
+
+
+def install_fake_embeddings() -> None:
+    """Replace argus.embeddings.embed with unit_vector, process-wide."""
+    from argus import embeddings
+
+    async def embed(text, *, run_id, conn=None, task_id=None, step_index=None):
+        if isinstance(text, str):
+            return unit_vector(text)
+        return [unit_vector(t) for t in text]
+
+    embeddings.embed = embed
+
+
 class _Resp:
     def __init__(self, content: str, eval_count: int):
         self.message = type("M", (), {"content": content, "thinking": None})()
@@ -49,6 +73,15 @@ def _between(text: str, start: str, end: str) -> str:
     return text[i + len(start): j if j >= 0 else None]
 
 
+def _fence(text: str, marker: str) -> str:
+    """Contents of the first <untrusted ...> block whose opening tag contains marker."""
+    # Require an attribute: the prompts also MENTION "<untrusted>" in prose.
+    for m in re.finditer(r"<untrusted(\s[^>]*)>(.*?)</untrusted>", text, re.S):
+        if marker in m.group(1):
+            return m.group(2)
+    return ""
+
+
 def _sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
@@ -60,9 +93,11 @@ class FakeBackend:
         self.counts: Dict[Tuple[str, str], int] = defaultdict(int)
         self.fail_first: Dict[Tuple[str, str], int] = {}
         self.wrong_number_first: Dict[str, int] = {}
-        #: first n extract calls put the fee sentence under `duration` (only
-        #: a critic can catch this: every word and number IS on the page)
-        self.mislabel_first: Dict[str, int] = {}
+        #: the first n extract calls OVERALL (any model) put the fee sentence
+        #: under `duration`. Only a critic can catch this: every word and
+        #: number IS on the page. Counted across models on purpose: the router
+        #: may send a retry to a different model.
+        self.mislabel_first: int = 0
         self.hang_on: Optional[Tuple[str, int]] = None
         self._resident: List[str] = []
 
@@ -106,8 +141,7 @@ class FakeBackend:
             return {"thought": "check the page", "steps": [{"template": "check_page",
                                                             "params": {"url": url, "fields": fields}}]}
         if role == "extract":
-            page = _between(prompt, "<untrusted", "</untrusted>")
-            page = page.split(">", 1)[1] if ">" in page else page
+            page = _fence(prompt, "source=")
             fields = [l[2:].strip() for l in _between(prompt, "# Fields to find", "# Page").splitlines()
                       if l.startswith("- ")]
             facts = []
@@ -125,15 +159,15 @@ class FakeBackend:
                         break
             if wrong > 0:
                 self.wrong_number_first[model] = wrong - 1
-            if self.mislabel_first.get(model, 0) > 0:
-                self.mislabel_first[model] -= 1
+            if self.mislabel_first > 0:
+                self.mislabel_first -= 1
                 by_key = {f["entity_key"]: f for f in facts}
                 if "fees" in by_key and "duration" in by_key:
                     by_key["duration"]["content"] = by_key["fees"]["content"]
             return {"facts": facts}
         if role == "critique":
-            page = _between(prompt, "<untrusted", "</untrusted>")
-            facts = _between(prompt, "# Extracted facts", "# Page")
+            page = _fence(prompt, "source=")
+            facts = _fence(prompt, 'kind="facts"')
             bad = nt.ungrounded_numbers(facts, page)
             mislabeled = [k for k, c in re.findall(r"- ([\w:]+): (.*)", facts)
                           if k in KEYWORDS and not any(w in c.lower() for w in KEYWORDS[k])]
@@ -155,7 +189,7 @@ class FakeBackend:
                              f"{content}" + (f" (was: {prev.group(1)})" if prev else ""))
             return {"digest": ". ".join(parts) + "."}
         if role == "propose_action":
-            digest = _between(prompt, "# Digest", "# Rules").strip()
+            digest = _fence(prompt, 'kind="digest"').strip()
             return {"action_kind": "outbox_message", "subject": "Changes detected",
                     "body": digest[:2000], "reasoning": "the digest reports real changes"}
         if role == "reflect":

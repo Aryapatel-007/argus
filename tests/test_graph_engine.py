@@ -215,7 +215,7 @@ def test_invented_number_is_caught_by_the_validator_before_any_critic(env):
 def test_critique_rejection_retries_extract_with_the_reflection(env):
     db_path, outbox = env
     backend = FakeBackend()
-    backend.mislabel_first = {m: 1 for m in MODELS}
+    backend.mislabel_first = 1
     _, _, out = run_once(db_path, outbox, PAGE_V1, backend=backend)
     extracts = q(db_path, "SELECT node_id, attempt, status, params FROM graph_nodes "
                  "WHERE node_type='extract' ORDER BY attempt")
@@ -257,6 +257,53 @@ def test_tiny_budget_prunes_optional_work_but_never_a_gate(env, monkeypatch):
     asyncio.run(eng.run_graph(gid))
     pruned = q(db_path, "SELECT node_type FROM graph_nodes WHERE skip_reason = 'budget'")
     assert all(p["node_type"] not in ("approval_gate", "execute_action") for p in pruned)
+
+
+def _exec_case(db_path, outbox, status, result_json=None, node_id="n-exec"):
+    from types import SimpleNamespace
+    from argus.graph import handlers
+    key = "idem-test"
+    with db.connect(db_path) as conn:
+        if status is not None:
+            with db.atomic(conn):
+                conn.execute("INSERT INTO runs (run_id, target_id, status) VALUES ('r', 't', 'running')")
+                conn.execute("INSERT INTO approvals (idempotency_key, target_id, action_kind, proposed_action, "
+                             "reasoning, status, created_run_id, result) "
+                             "VALUES (?, 't', 'outbox_message', '{}', 'x', ?, 'r', ?)", (key, status, result_json))
+        ex = SimpleNamespace(inputs={"approval": {"idempotency_key": key}}, store=GraphStore(conn),
+                             services=SimpleNamespace(actions=ActionExecutor(outbox)), run_id="r",
+                             node=SimpleNamespace(node_id=node_id))
+        result = asyncio.run(handlers._execute(ex))
+        row = conn.execute("SELECT status, result FROM approvals").fetchone() if status else None
+    return result, row
+
+
+@pytest.mark.parametrize("status,claim", [
+    ("pending", None), ("rejected", None), (None, None),
+    ("executed", '{"claimed_by": "someone-else", "state": "claimed"}'),
+])
+def test_executor_refuses_anything_but_an_approved_row_or_its_own_claim(env, status, claim):
+    """Third, independent gate check (D-019). Readiness makes this path
+    unreachable in a normal run, so it is driven directly here."""
+    db_path, outbox = env
+    result, _ = _exec_case(db_path, outbox, status, claim)
+    assert result.status == "failed"
+    assert not outbox.exists()
+
+
+def test_executor_claims_the_row_before_acting(env):
+    db_path, outbox = env
+    result, row = _exec_case(db_path, outbox, "approved")
+    assert result.status == "done" and len(list(outbox.iterdir())) == 1
+    assert row["status"] == "executed" and json.loads(row["result"])["claimed_by"] == "n-exec"
+
+
+def test_executor_finishes_its_own_claim_after_a_crash(env):
+    """Crash between the claim and the effect: the row already says executed,
+    claimed by this node, so the resumed node completes it (once)."""
+    db_path, outbox = env
+    result, _ = _exec_case(db_path, outbox, "executed", '{"claimed_by": "n-exec", "state": "claimed"}')
+    assert result.status == "done" and len(list(outbox.iterdir())) == 1
 
 
 def test_llm_calls_carry_node_strategy_and_decision(env):

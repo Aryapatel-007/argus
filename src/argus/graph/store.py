@@ -248,6 +248,11 @@ class GraphStore:
             (expansion_id,),
         ).fetchone()
         if prior is not None:
+            if complete_node is not None and self.node(complete_node[0]).status == "running":
+                # The node and its expansion always commit together, so a
+                # stored expansion with a still-running requester means the
+                # id was reused by someone else: a bug, never a resume.
+                raise RuntimeError(f"expansion id {expansion_id!r} already used by another expansion")
             return bool(prior["accepted"]), [
                 validator.Violation(**v) for v in json.loads(prior["violations"] or "[]")
             ]
@@ -468,6 +473,22 @@ class GraphStore:
                 "WHERE graph_id = ?",
                 (status, finished, graph_id),
             )
+
+    def finish_graph(self, graph_id: str, status: str) -> None:
+        """Graph status AND its run's status, one transaction (review M5).
+        The run is closed only when none of its graphs is still open."""
+        with self._tx():
+            finished = _now() if status in ("done", "failed") else None
+            self.conn.execute(
+                "UPDATE graphs SET status = ?, finished_at = COALESCE(?, finished_at) WHERE graph_id = ?",
+                (status, finished, graph_id))
+            if status in ("done", "failed"):
+                run_id = self.conn.execute("SELECT run_id FROM graphs WHERE graph_id = ?",
+                                           (graph_id,)).fetchone()["run_id"]
+                self.conn.execute(
+                    "UPDATE runs SET status = ?, finished_at = ? WHERE run_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM graphs WHERE run_id = ? AND status IN ('running', 'waiting_approval'))",
+                    (status, finished, run_id, run_id))
 
     def add_usage(self, graph_id: str, *, tokens: int = 0, seconds: float = 0.0) -> None:
         with self._tx():

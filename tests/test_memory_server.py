@@ -1424,6 +1424,7 @@ class TestEveryToolReturnsStructuredOutput(MemoryServerTestCase):
             },
             "recall_facts": {"query": "probe query"},
             "list_changes_since": {"since": "2000-01-01T00:00:00.000Z"},
+            "list_current_facts": {"target_id": TARGET},
         }
 
     async def test_every_tool_returns_non_null_structured_content(self) -> None:

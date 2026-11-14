@@ -738,7 +738,7 @@ class MemoryServer:
         scored.sort(key=lambda f: (-f.score, f.fact_id))
         return scored[:limit]
 
-    async def list_current_facts(self, target_id: str, limit: int = 200) -> list["CurrentFact"]:
+    async def list_current_facts(self, target_id: str, limit: int = 1000) -> list["CurrentFact"]:
         """Every CURRENT fact of one target. No embedding, no ranking.
 
         The graph's `recall` node uses this to diff a page against memory:
@@ -1001,7 +1001,7 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
             "everything already known about the target."
         ),
     )
-    async def list_current_facts(target_id: str, limit: int = 200) -> list[CurrentFact]:
+    async def list_current_facts(target_id: str, limit: int = 1000) -> list[CurrentFact]:
         return await backend.list_current_facts(target_id=target_id, limit=limit)
 
     @mcp.tool(

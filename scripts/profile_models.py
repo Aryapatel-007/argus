@@ -99,7 +99,7 @@ class Profiler:
                 if "embed" in tag:
                     self.client.embed(model=tag, input="x", keep_alive=0)
                 else:
-                    self.client.generate(model=tag, prompt="", keep_alive=0)
+                    self.client.generate(model=tag, prompt="", keep_alive=0, think=False)
             except Exception as exc:  # noqa: BLE001
                 log(f"unload {tag}: {exc!r}")
         deadline = time.time() + 30
@@ -114,7 +114,7 @@ class Profiler:
         if "embed" in tag:
             r = self.client.embed(model=tag, input="warm", keep_alive="10m")
         else:
-            r = self.client.generate(model=tag, prompt="", keep_alive="10m")
+            r = self.client.generate(model=tag, prompt="", keep_alive="10m", think=False)
         wall = time.perf_counter() - start
         return max(wall, (getattr(r, "load_duration", 0) or 0) / NS)
 
@@ -170,6 +170,9 @@ class Profiler:
         rates: List[float] = []
         for node_type in node_fixtures.LLM_NODE_TYPES:
             spec = llm_nodes.node(node_type)
+            # entity_match is the model check INSIDE resolve_entity; the router
+            # looks profiles up by node type, so store it under that name.
+            profile_key = "resolve_entity" if node_type == "entity_match" else node_type
             valid = calls = 0
             scores, tokens, latencies, stable = [], [], [], []
             for fx in node_fixtures.by_type(node_type):
@@ -193,11 +196,11 @@ class Profiler:
                         f"score={ev['score']:.2f} {wall:.1f}s {err or ''}"[:220])
                 if len(sigs) >= 2:
                     stable.append(sum(s == sigs[0] for s in sigs[1:]) / (len(sigs) - 1))
-            self.put(model, node_type, "json_valid_rate", valid / calls if calls else None, calls)
-            self.put(model, node_type, "quality", statistics.mean(scores) if scores else None, len(scores))
-            self.put(model, node_type, "stability", statistics.mean(stable) if stable else None, len(stable))
-            self.put(model, node_type, "mean_eval_tokens", statistics.mean(tokens) if tokens else None, len(tokens))
-            self.put(model, node_type, "mean_latency_s", statistics.mean(latencies) if latencies else None,
+            self.put(model, profile_key, "json_valid_rate", valid / calls if calls else None, calls)
+            self.put(model, profile_key, "quality", statistics.mean(scores) if scores else None, len(scores))
+            self.put(model, profile_key, "stability", statistics.mean(stable) if stable else None, len(stable))
+            self.put(model, profile_key, "mean_eval_tokens", statistics.mean(tokens) if tokens else None, len(tokens))
+            self.put(model, profile_key, "mean_latency_s", statistics.mean(latencies) if latencies else None,
                      len(latencies))
         return rates
 
@@ -226,21 +229,30 @@ class Profiler:
 
     def coresidency(self, models: List[str]) -> None:
         embed = config.normalize_tag(config.load_config()["models"]["embed"])
+        # BOTH load orders: measured order-dependent (2026-11-14). Loading
+        # nomic then qwen evicts nomic; Sprint 2 loaded qwen then nomic and
+        # both stayed. A pair counts as co-resident only if both orders keep
+        # both, because the scheduler cannot control which one loads first.
         for a, b in itertools.combinations(sorted(set(models + [embed])), 2):
-            self.unload_all()
-            try:
-                self.load(a)
-                self.load(b)
-                time.sleep(1.0)
-                loaded = self.loaded()
-                both = a in loaded and b in loaded
-                detail = {t: {"size": getattr(m, "size", None), "size_vram": getattr(m, "size_vram", None)}
-                          for t, m in loaded.items()}
-            except Exception as exc:  # noqa: BLE001
-                both, detail = False, {"error": repr(exc)}
+            orders = {}
+            for first, second in ((a, b), (b, a)):
+                self.unload_all()
+                try:
+                    self.load(first)
+                    self.load(second)
+                    time.sleep(1.0)
+                    loaded = self.loaded()
+                    orders[f"{first} then {second}"] = {
+                        "both": first in loaded and second in loaded,
+                        "loaded": {t: {"size": getattr(m, "size", None),
+                                       "size_vram": getattr(m, "size_vram", None)} for t, m in loaded.items()}}
+                except Exception as exc:  # noqa: BLE001
+                    orders[f"{first} then {second}"] = {"both": False, "error": repr(exc)}
+            both = all(o["both"] for o in orders.values())
             with db.atomic(self.conn):
-                registry.write_coresidency(self.conn, a, b, both, json.dumps(detail))
-            log(f"  co-resident {a} + {b}: {both}")
+                registry.write_coresidency(self.conn, a, b, both, json.dumps(orders))
+            per_order = ", ".join(f"{k}: {v['both']}" for k, v in orders.items())
+            log(f"  co-resident {a} + {b}: {both} ({per_order})")
 
 
 def write_notes(db_path: Path, models: List[str]) -> Path:

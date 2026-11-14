@@ -122,7 +122,7 @@ class Router:
                 "prior_quality": round(prior_q, 4), "alpha": round(alpha, 3), "beta": round(beta, 3),
                 "latency_s": round(latency, 3), "swap_s": round(swap, 3), "risk": round(risk, 4),
                 "utility": round(utility, 4), "greedy_utility": round(greedy, 4),
-                "resident": model in resident, "health": self.health.status(model)}
+                "resident": model in resident, "health": self.health.routable(model)}
 
     def candidates(self, node_type: str, difficulty: float, resident: Set[str],
                    exclude: Iterable[str] = (), node_id: str = "", learning: bool = False
@@ -157,8 +157,13 @@ class Router:
         learning = self.mode == "learning"
         cands = self.candidates(node_type, difficulty, resident, exclude, node_id, learning)
         usable = [c for c in cands if not c["excluded"]] or [c for c in cands if c["excluded"] != "independence"]
+        independence_note = ""
         if not usable:
-            usable = cands  # nothing else exists: better a degraded model than no answer
+            # Only when the WHOLE pool is the subject's own model (a one-model
+            # pool). Recorded in the decision, and the critic reward is never
+            # applied when author == critic (engine._reward_ops). D-022.
+            usable = cands
+            independence_note = " [NO INDEPENDENT MODEL IN POOL: critic shares the author's model]"
         explore = False
         chosen = usable[0]
         if learning:
@@ -173,12 +178,14 @@ class Router:
                     chosen = greedy
         state.decisions += 1
         state.explorations += int(explore)
+        if chosen.get("health") == "trial":
+            self.health.grant_trial(chosen["model"])  # its ONE half-open call
 
         strategy, models = self._strategy(node_type, difficulty, attempt, has_reflection,
                                           default_strategy, chosen, usable)
         reason = (f"{chosen['model']} utility {chosen['utility']:.3f} "
                   f"(q {chosen['quality']:.2f}, lat {chosen['latency_s']:.1f}s, swap {chosen['swap_s']:.1f}s, "
-                  f"risk {chosen['risk']:.2f})" + (" [explore]" if explore else ""))
+                  f"risk {chosen['risk']:.2f})" + (" [explore]" if explore else "") + independence_note)
         return Decision(chosen["model"], models, strategy, cands, explore, reason, self.mode)
 
     def _strategy(self, node_type, difficulty, attempt, has_reflection, default, chosen, usable):

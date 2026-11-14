@@ -12,6 +12,8 @@ and reports what changed.
 
 $catalog
 
+$hints_block
+
 $trigger_block
 
 # Rules
