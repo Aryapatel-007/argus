@@ -44,6 +44,17 @@ def log(msg: str) -> None:
     print(f"[argus-scheduler {datetime.now().strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
 
+def _write_quietly(db_path: Path, sql: str, params: tuple) -> None:
+    """A bookkeeping write inside the recovery loop. If the database is busy
+    or broken it is logged, never raised: a note about one run must not stop
+    recovery of the next (review 2, L3)."""
+    try:
+        with db.connect(db_path) as conn, db.atomic(conn):
+            conn.execute(sql, params)
+    except Exception as exc:  # noqa: BLE001
+        log(f"bookkeeping write failed: {exc!r}")
+
+
 def interrupted_runs(db_path: Path) -> List[str]:
     """Runs with a graph still 'running' whose lease is gone or whose owner
     process is dead: what a hard kill leaves behind."""
@@ -110,7 +121,12 @@ class Scheduler:
                 for run_id in runs:
                     try:
                         outs = await s.resume(run_id)
-                        self.failures.pop(run_id, None)
+                        if self.failures.pop(run_id, None) is not None:
+                            # The old "recovery failed" note would outlive the
+                            # recovery on the dashboard (review 2, L3). Only our
+                            # own note is cleared, never a run's real error.
+                            _write_quietly(db_path, "UPDATE runs SET error = NULL WHERE run_id = ? "
+                                                    "AND error LIKE 'recovery failed%'", (run_id,))
                         log(f"resumed {run_id}: {[o.status for o in outs]}")
                     except lease.LeaseLost:
                         log(f"{run_id} is owned by a live process; left alone")
@@ -120,8 +136,7 @@ class Scheduler:
                         self.failures[run_id] = (count, now + delay)
                         msg = (f"recovery failed {count}x, next try in {delay / 60:.0f} min: {exc!r}")[:500]
                         log(f"resume {run_id}: {msg}")
-                        with db.connect(db_path) as conn, db.atomic(conn):
-                            conn.execute("UPDATE runs SET error = ? WHERE run_id = ?", (msg, run_id))
+                        _write_quietly(db_path, "UPDATE runs SET error = ? WHERE run_id = ?", (msg, run_id))
 
     async def reflect(self, target: Dict[str, Any]) -> None:
         if new_facts_since_reflect(Path(self.opts.db_path), target["id"]) < MIN_NEW_FACTS_FOR_REFLECT:

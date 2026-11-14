@@ -5,67 +5,60 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** G — benchmark RE-RUNNING on fixed code (delta findings fixed, see D-027/D-028)
-- **Branch:** main. Phases A-F merged (`wip/phase-e`, `wip/phase-f` kept).
-- **Test count:** 436 passing. Never drops.
-- **Mutation check:** 24/24 killed. **Security scan:** 0 blocking
+- **Phase:** G. Run 1 is done: **learning loses to the baseline**. A
+  debugger fix is next.
+- **Branch:** main. Phases A-F are merged; `wip/phase-e` and `wip/phase-f`
+  are kept.
+- **Test count:** 480 passing. It never drops.
+- **Mutation check:** 27/27 killed. **Security scan:** 0 blocking
   (`notes/security-audit-phase-f.md`).
-- **Blocked:** no
+- **Blocked:** no. This becomes `BLOCKED: needs Arya` only if learning still
+  loses after a real fix and a rerun (ARGUS_BUILD 8).
 
-## STOPPED (usage limit, 2026-11-14 ~17:55). Resume here.
+## Phase G run 1 (2026-11-15), see notes/routing-results.md
 
-Phase G run was STOPPED on purpose after 13 baseline scenarios (all q=1.0
-except s13 0.33, ~40-67s each, 0 swaps, 0 gate violations; see
-data/phase-g.log). Its numbers must NOT be used: a delta review of commit
-a26c456 found flaws that bias the benchmark. Fix these FIRST, with tests,
-then rerun `python scripts/phase_g.py` (detached; no other Ollama work
-while it runs). Judge calibration from that run: gemma4:e4b 0.83, qwen3.5:9b
-0.79, phi4-mini 0.29, llama3.1 0.29 (check judge-calibration.json: 0.29 may
-be invalid-JSON counted as disagreement).
+| | baseline | fixed | learning |
+|---|---|---|---|
+| Quality | 0.958 | 0.867 | 0.913 |
+| Seconds per scenario | 46 | 87 | 92 |
+| Model swaps | 0 | 112 | 112 |
 
-Delta review findings (all open):
-- H-B `llm_nodes.still_stated` unanchored substring: "IELTS overall 6" is
-  "stated" on a page saying 6.5; also 12 vs 120, 45,000 vs 45,000,000, list
-  extended after the old text; a stored "." matches everything. Anchor on
-  word/number boundaries + sentence end; empty canon = not stated; tests.
-- H-A browser.py: `context.route` sees only the FIRST url of a redirect
-  chain, so HTTP 30x hops (top-level goto and subresources) reach internal
-  hosts; robots fetch via context.request follows redirects unrouted. Fix:
-  route.fetch(max_redirects=0) + re-check Location, max_redirects=0 on
-  robots; add HTTP-302 tests (subresource and top level) with `other.hits`.
-- M-A s08 needs `silent=True, kinds={"fees": "unchanged"}`; consider a
-  symmetric equivalence check in still_stated (same numbers + mutual high
-  overlap) so a re-worded extraction is not "modified".
-- M-B scheduler.reflect (and start_run failing after its first commit)
-  strands the lease like M1 did; share the release helper; test.
-- M-C recover cap: in-memory, permanent, silent. Use backoff + a visible
-  marker (runs.status 'parked' + dashboard row).
-- M-D harness: judge loads a different model between scenarios, biasing the
-  next scenario's routing and wall time. Judge AFTER all scenarios of a mode.
-- M-E harness: score "all expected runs completed with acceptable graph
-  status" (except s24); today a failed last run can pass vacuously.
-- M-F harness gate metric: count any approval status != pending (incl.
-  failed) or resolved_at set; scan approvals.proposed_action for forbidden
-  tokens (s12 exists for that).
-- M-G browser: http->https upgrade refused (port in origin key); align with
-  handlers.same_site.
-- M-H browser `_internal`: trailing-dot localhost, 100.64/10 (use
-  `not ip.is_global`); DNS-to-private names remain a documented residual.
-- Lows: old Chromium/driver not closed on relaunch; IDN punycode vs unicode
-  host; robots network error should mean disallow; busy-loop test assertion
-  weak; judge gets pipeline diff items as "ground truth" (state this in the
-  Phase G write-up); procedural memory contributes nothing to the measured
-  learning pass (state it).
+- Gate violations were 0 in every mode.
+- **The loss is in the structure scenarios:**
+  - s14, s15 and s20 lost because work was routed to phi4-mini. It handled
+    plan, extract and critique worse than qwen.
+  - s13 lost because of a harness bug, now fixed (L2).
+- **Root-cause hypothesis:** the reward is "passed validation", which is
+  nearly always 1 (extract/phi4 α102 β5). The bandit therefore cannot see
+  quality, and the cost-aware router prefers the cheaper model. Mixing
+  models also costs about 4.7 swaps per scenario, because qwen3.5:9b
+  co-resides with nothing.
 
-## Then
+## Next
 
-- Write `notes/routing-results.md`: the table from
-  `notes/eval/phase-g-table.md` plus an honest reading (where the graph
-  engine wins or loses: quality, wall clock, swaps, timeouts, gate
-  violations = 0 required in all three). If the learning engine does not
-  beat the baseline after real effort: `BLOCKED: needs Arya` (ARGUS_BUILD 8).
-- Check the definition of done (ARGUS_BUILD 9) item by item and update
-  README/CLAUDE.md/this file.
+1. **Debugger investigation** (ARGUS_BUILD 8). Use `debugger` at xhigh on
+   the reward signal and the router.
+   - Use only principled fixes, no tuning to the 24 scenarios. Candidates:
+     - credit downstream outcomes back to the producing node (critic
+       rejection, cross-model disagreement, an empty retry);
+     - make swap cost per scenario count against switching;
+     - require evidence before an arm displaces the profiler's
+       quality-best model on a role.
+   - Re-measure with `python scripts/phase_g.py`, run detached, with no
+     other Ollama work at the same time. Unload the judge model afterwards
+     (`ollama stop gemma4:e4b`), because it holds about 7 GB of RAM.
+2. If learning still loses, write `BLOCKED: needs Arya` here with the
+   numbers.
+3. Check the definition of done (ARGUS_BUILD 9) item by item. Update
+   README, CLAUDE.md and this file.
+
+## Second delta review (of a602fb2): fixed and committed
+
+- **H1, M3, M4:** `still_stated` (D-029).
+- **H2, M1, M2, L5, L6:** browser (D-030).
+- **L1, L2:** harness.
+- **L3:** scheduler.
+- **Tests:** `tests/test_delta2_review.py`.
 
 ## Phase log
 

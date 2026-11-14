@@ -48,14 +48,19 @@ def canon(text: str) -> str:
     return re.sub(r"(?<=\d),(?=\d{3}\b)", "", norm_space(text))
 
 
-def _canon_lines(text: str) -> str:
-    """canon() per line, keeping line breaks: a line end is a statement end."""
-    return "\n".join(canon(line) for line in (text or "").splitlines() if line.strip())
+#: What may NOT follow a stated fact: more of the same word or number, a
+#: decimal ("6" in "6.5"), a thousands/range/list continuation (",", "-",
+#: "/", "&", "and"). Anything else (a new word, a sentence end) is fine, so a
+#: phrase-shaped fact ("2 years" in "2 years full-time") still matches
+#: (review M4) while a list that grows ("February and July, and November")
+#: or a value that grows ("12" -> "120") does not (H-B).
+_STATEMENT_END = r"(?![a-z0-9])(?!\s*(?:[,/&–—-]|\.\d|\d|and\b))"
 
-
-#: What may follow a stated fact: end of text, end of line, or a sentence
-#: mark that is NOT the start of a decimal ("6." in "6.5" is not an end).
-_STATEMENT_END = r"(?=\s*(?:$|\n|[.;!?](?!\d)))"
+#: Words that only label a value. Ignored when deciding whether a re-worded
+#: numeric fact still says the same thing. Qualifiers ("domestic", "per
+#: year", "not", "refundable") are NOT here, so changing one is a change.
+_LABEL_WORDS = frozenset({"the", "annual", "tuition", "fee", "fees", "cost", "costs", "price", "for",
+                          "is", "are", "aud", "usd", "amount", "of", "total"})
 
 
 def still_stated(stored: str, page_text: str, extracted: Optional[str] = None) -> bool:
@@ -67,30 +72,29 @@ def still_stated(stored: str, page_text: str, extracted: Optional[str] = None) -
     sits inside "IELTS overall 6.5", "Places: 12" inside "Places: 120", and
     "Intakes: February and July" inside "February and July, and November".
 
-    Also true when a numeric fact's new extraction carries exactly the same
-    numbers and nearly the same words both ways (mutual overlap >= 0.75):
-    the extractor re-phrased an unchanged value (review M-A). Facts without
-    numbers do not get this path, because a list that grows keeps its old
-    words (the s03 finding).
+    Also true when a numeric fact's new extraction is the same statement
+    re-worded: the same numbers IN THE SAME ORDER and the same words once
+    pure labels ("fee", "tuition", "AUD"...) are ignored. Overlap ratios are
+    not used (delta review 2, H1): "for domestic" -> "for international",
+    "per year" -> "per semester", "refundable" -> "not refundable" and two
+    swapped values all overlap highly and are all real changes.
     """
     s = canon(stored).rstrip(" .;:,")
+    e = canon(extracted).rstrip(" .;:,") if extracted is not None else None
+    if e is not None and e and e == s:
+        return True  # identical extraction, however short (review M3)
     if len(s) < 3 or not re.search(r"[a-z0-9]", s):
         return False
     pattern = r"(?<![a-z0-9])" + re.escape(s) + _STATEMENT_END
-    if re.search(pattern, _canon_lines(page_text)):
+    if re.search(pattern, canon(page_text)):
         return True
-    if extracted is None:
+    if not e:
         return False
-    e = canon(extracted).rstrip(" .;:,")
-    if e == s:
-        return True
-    ns, ne = sorted(nt.numeric_tokens(s)), sorted(nt.numeric_tokens(e))
+    ns, ne = nt.numeric_tokens(s), nt.numeric_tokens(e)
     if not ns or ns != ne:
         return False
-    ws, we = set(words(s)), set(words(e))
-    if not ws or not we:
-        return False
-    return len(ws & we) / len(ws) >= 0.75 and len(ws & we) / len(we) >= 0.75
+    content = lambda t: {w for w in re.findall(r"[a-z]+", t) if w not in _LABEL_WORDS}  # noqa: E731
+    return content(s) == content(e)
 
 
 def supported(claim: str, evidence: str, min_overlap: float = 0.6) -> bool:

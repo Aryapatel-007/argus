@@ -50,3 +50,17 @@ Phase C fixes (2 high, 5 medium), Phase E (2 high, 8 medium), Phase E delta
 (1 high, 3 medium), Phase F (1 high, 4 medium). Every finding was fixed with
 a test; most have a mutant in `scripts/mutation_check.py` (22/22 killed).
 Nothing critical is open.
+
+## Addendum: second delta review (after a602fb2)
+
+**Fixed:**
+- Numeric IPv4 spellings are canonicalised before the internal-address check.
+- Names other than the page host are resolved, and any private answer blocks them.
+- A redirect chain past 5 hops is aborted, never handed back to Chromium.
+- A redirected non-GET request is refused.
+
+All of these are covered in `tests/test_delta2_review.py`, and the decisions are recorded in D-030.
+
+**Residual (accepted, local-only tool):**
+- DNS rebinding between Argus's lookup and the fetch's own lookup is not closed. Closing it needs a pinned resolver, which the Playwright route API does not offer.
+- A redirect followed on a subresource carries the original request's headers. These come from a fresh, cookie-less context per call.

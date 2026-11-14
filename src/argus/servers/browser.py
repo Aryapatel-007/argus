@@ -40,7 +40,7 @@ import time
 import urllib.robotparser
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 if __package__ in (None, ""):  # direct-script execution
@@ -53,6 +53,58 @@ SERVER_NAME = "argus-browser"
 USER_AGENT = "ArgusMonitor/0.3 (local personal monitoring; +robots.txt respected)"
 MAX_TEXT_CHARS = 200_000
 MAX_LINKS = 200
+MAX_HOPS = 5
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _legacy_ipv4(host: str) -> Optional[ipaddress.IPv4Address]:
+    """Parse a host the way browsers do (WHATWG URL "IPv4 parser").
+
+    Chromium and Node both turn 2130706433, 0x7f000001, 127.1 and
+    017700000001 into 127.0.0.1 before connecting, while `ipaddress` rejects
+    them, so without this they read as harmless names (delta review 2, H2).
+    Returns None for anything that is not a numeric IPv4 host."""
+    parts = host.split(".")
+    if parts and parts[-1] == "":
+        parts.pop()  # one trailing dot is allowed
+    if not parts or len(parts) > 4:
+        return None
+    nums = []
+    for p in parts:
+        if not p:
+            return None
+        try:
+            if p[:2].lower() == "0x":
+                n = int(p[2:] or "0", 16)
+            elif len(p) > 1 and p[0] == "0":
+                n = int(p[1:], 8)
+            else:
+                if not p.isdigit():
+                    return None
+                n = int(p, 10)
+        except ValueError:
+            return None
+        nums.append(n)
+    if any(n > 255 for n in nums[:-1]) or nums[-1] >= 256 ** (5 - len(nums)):
+        return None
+    value = nums[-1]
+    for i, n in enumerate(nums[:-1]):
+        value += n << (8 * (3 - i))
+    return ipaddress.IPv4Address(value)
+
+
+def _canon_host(host: str) -> str:
+    """Numeric IPv4 spellings -> dotted quad; IPv4-mapped IPv6 -> IPv4."""
+    legacy = _legacy_ipv4(host)
+    if legacy is not None:
+        return str(legacy)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return host
 
 
 def _host_of(url: str) -> str:
@@ -77,6 +129,7 @@ def _host_of(url: str) -> str:
     except UnicodeError:
         pass
     h = h[4:] if h.startswith("www.") else h
+    h = _canon_host(h)
     if ":" in h:
         h = f"[{h}]"
     if port is None or port == {"http": 80, "https": 443}.get(u.scheme):
@@ -92,7 +145,7 @@ def _internal(key: str) -> bool:
         host = host[1:host.index("]")]
     elif host.count(":") == 1:
         host = host.rsplit(":", 1)[0]
-    host = host.rstrip(".")
+    host = _canon_host(host.rstrip("."))
     if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
         return True
     try:
@@ -100,6 +153,21 @@ def _internal(key: str) -> bool:
     except ValueError:
         return False
     return not ip.is_global
+
+
+def _bare_host(key: str) -> str:
+    """Origin key -> host without port or brackets."""
+    if key.startswith("["):
+        return key[1:key.index("]")]
+    return key.rsplit(":", 1)[0] if key.count(":") == 1 else key
+
+
+def _is_ip_literal(key: str) -> bool:
+    try:
+        ipaddress.ip_address(_canon_host(_bare_host(key)))
+        return True
+    except ValueError:
+        return False
 
 
 def request_allowed(request_url: str, page_host: str) -> bool:
@@ -138,8 +206,18 @@ class PageResult(BaseModel):
 
 class BrowserBackend:
     def __init__(self, *, throttle_s: float = 2.0, timeout_s: float = 30.0,
-                 idle_timeout_s: float = 8.0, respect_robots: bool = True, read_timeout_s: float = 15.0):
+                 idle_timeout_s: float = 8.0, respect_robots: bool = True, read_timeout_s: float = 15.0,
+                 resolve_dns: bool = True, robots_ttl_s: float = 86_400.0, robots_error_ttl_s: float = 300.0):
         self.throttle_s = throttle_s
+        #: Resolve other hosts' names before fetching and refuse a name that
+        #: points at a private address (delta review 2, H2). Residual: the
+        #: fetch resolves again, so DNS rebinding between the two is not
+        #: closed; that needs a pinned resolver (notes/security-audit-phase-f.md).
+        self.resolve_dns = resolve_dns
+        #: robots.txt answers are cached for a day; an unreachable or failing
+        #: robots.txt (read as "disallow") only for minutes (review L6).
+        self.robots_ttl_s = robots_ttl_s
+        self.robots_error_ttl_s = robots_error_ttl_s
         self.read_timeout_s = read_timeout_s
         self.timeout_ms = int(timeout_s * 1000)
         self.idle_timeout_ms = int(idle_timeout_s * 1000)
@@ -149,7 +227,8 @@ class BrowserBackend:
         self._launch_lock = asyncio.Lock()
         self._host_locks: Dict[str, asyncio.Lock] = {}
         self._host_last: Dict[str, float] = {}
-        self._robots: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
+        #: origin -> (parser or None for "no robots.txt", monotonic expiry)
+        self._robots: Dict[str, Tuple[Optional[urllib.robotparser.RobotFileParser], float]] = {}
         self.open_contexts = 0  # tests assert this returns to 0
 
     async def _ensure_browser(self):
@@ -193,25 +272,52 @@ class BrowserBackend:
                 await asyncio.sleep(wait)  # rate limit per host, not a readiness wait
             self._host_last[host] = time.monotonic()
 
+    async def _resolves_internal(self, url: str, cache: Dict[str, bool]) -> bool:
+        """True if a host NAME resolves to any non-global address, or cannot
+        be resolved at all (nothing to fetch then; fail closed)."""
+        if not self.resolve_dns or _is_ip_literal(_host_of(url)):
+            return False
+        host = (urlparse(url).hostname or "").rstrip(".")
+        if host in cache:
+            return cache[host]
+        try:
+            infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(host, None), timeout=5)
+            bad = not infos or any(_internal(str(info[4][0]).split("%", 1)[0]) for info in infos)
+        except Exception as exc:  # noqa: BLE001
+            log(f"dns lookup failed for {host}: {exc!r}; blocked")
+            bad = True
+        cache[host] = bad
+        return bad
+
+    @staticmethod
+    def _disallow_all() -> urllib.robotparser.RobotFileParser:
+        parser = urllib.robotparser.RobotFileParser()
+        parser.parse(["User-agent: *", "Disallow: /"])
+        return parser
+
     async def _robots_allows(self, context, url: str) -> bool:
         if not self.respect_robots:
             return True
         parts = urlparse(url)
         origin = f"{parts.scheme}://{parts.netloc}"
-        if origin not in self._robots:
+        now = time.monotonic()
+        cached = self._robots.get(origin)
+        if cached is None or cached[1] <= now:
             parser: Optional[urllib.robotparser.RobotFileParser] = None
+            ttl = self.robots_ttl_s
             try:
-                # No automatic redirects (review H-A): follow at most five
-                # same-origin hops ourselves; a cross-origin robots redirect
-                # is not followed and reads as "no robots.txt".
+                # No automatic redirects (review H-A): follow at most
+                # MAX_HOPS same-origin hops ourselves. A cross-origin hop, or
+                # hops running out (review M1), leaves a 3xx: RFC 9309 calls
+                # that "unavailable", which allows.
                 target = origin + "/robots.txt"
                 resp = await context.request.get(target, timeout=10_000, max_redirects=0)
-                for _ in range(5):
-                    if resp.status not in (301, 302, 303, 307, 308):
-                        break
+                hops = 0
+                while resp.status in REDIRECT_STATUSES and hops < MAX_HOPS:
                     nxt = urljoin(target, resp.headers.get("location", ""))
                     if _host_of(nxt) != _host_of(origin):
                         break
+                    hops += 1
                     target = nxt
                     resp = await context.request.get(target, timeout=10_000, max_redirects=0)
                 if resp.ok:
@@ -219,14 +325,12 @@ class BrowserBackend:
                     parser.parse((await resp.text()).splitlines())
                 elif resp.status >= 500:
                     # RFC 9309: a server error on robots.txt means disallow.
-                    parser = urllib.robotparser.RobotFileParser()
-                    parser.parse(["User-agent: *", "Disallow: /"])
+                    parser, ttl = self._disallow_all(), self.robots_error_ttl_s
             except Exception as exc:  # noqa: BLE001 - RFC 9309: unreachable means disallow
-                log(f"robots.txt unreachable for {origin}: {exc!r}; treating as disallow")
-                parser = urllib.robotparser.RobotFileParser()
-                parser.parse(["User-agent: *", "Disallow: /"])
-            self._robots[origin] = parser
-        parser = self._robots[origin]
+                log(f"robots.txt unreachable for {origin}: {exc!r}; treating as disallow for now")
+                parser, ttl = self._disallow_all(), self.robots_error_ttl_s
+            self._robots[origin] = (parser, now + ttl)
+        parser = self._robots[origin][0]
         return parser is None or parser.can_fetch(USER_AGENT, url)
 
     async def open_page(self, url: str) -> PageResult:
@@ -251,6 +355,15 @@ class BrowserBackend:
         self.open_contexts += 1
         page_host = _host_of(url)
         blocked: List[str] = []
+        dns_cache: Dict[str, bool] = {}
+        #: set by the guard for the main-frame navigation: "redirect" is a
+        #: same-origin hop to re-navigate to, "refused" a cross-origin one.
+        nav: Dict[str, str] = {}
+
+        async def allowed(u: str) -> bool:
+            if not request_allowed(u, page_host):
+                return False
+            return _host_of(u) == page_host or not await self._resolves_internal(u, dns_cache)
 
         async def guard(route):
             """Every request, every redirect hop (delta review H-A).
@@ -259,22 +372,38 @@ class BrowserBackend:
             redirect chain, so letting the browser follow redirects would let
             a public URL bounce a request into the LAN. Instead the request is
             fetched with redirects off and each Location is checked before
-            the next hop. A top-level navigation may only move within its own
-            origin."""
+            the next hop. A 3xx is NEVER fulfilled: the browser would follow
+            it unchecked, so running out of hops aborts (review 2, M1).
+
+            The main-frame navigation does not follow its redirects here:
+            the hop is handed back to open_page, which navigates to it, so
+            page.url (and so every relative link) is right (review 2, M2).
+            Other navigations (iframes) may only move within the origin.
+            A redirected non-GET request is refused rather than re-sent."""
             req = route.request
             url = req.url
-            if not request_allowed(url, page_host):
+            main_nav = False
+            try:
+                main_nav = req.is_navigation_request() and req.frame.parent_frame is None
+            except Exception:  # noqa: BLE001 - service-worker requests have no frame
+                pass
+            if not await allowed(url):
                 blocked.append(url)
                 await route.abort("blockedbyclient")
                 return
             try:
                 resp = await route.fetch(max_redirects=0)
-                for _ in range(5):
-                    if resp.status not in (301, 302, 303, 307, 308):
-                        break
+                hops = 0
+                while resp.status in REDIRECT_STATUSES:
                     nxt = urljoin(url, resp.headers.get("location", ""))
-                    if not request_allowed(nxt, page_host) or (
-                            req.is_navigation_request() and _host_of(nxt) != page_host):
+                    same = _host_of(nxt) == page_host
+                    if main_nav:
+                        nav["redirect" if same else "refused"] = nxt
+                        await route.abort("blockedbyclient")
+                        return
+                    hops += 1
+                    if (hops > MAX_HOPS or req.method not in ("GET", "HEAD") or not await allowed(nxt)
+                            or (req.is_navigation_request() and not same)):
                         blocked.append(nxt)
                         await route.abort("blockedbyclient")
                         return
@@ -294,12 +423,37 @@ class BrowserBackend:
                 return PageResult(url=url, ok=False, partial=True, confidence=0.0,
                                   error="disallowed by robots.txt", elapsed_s=time.monotonic() - start)
             page = await context.new_page()
-            try:
-                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
-            except Exception as exc:  # noqa: BLE001 - unreachable, DNS, timeout
-                return PageResult(url=url, ok=False, partial=True, confidence=0.0,
-                                  error=f"navigation failed: {type(exc).__name__}: {str(exc)[:300]}",
-                                  elapsed_s=time.monotonic() - start)
+            target, response, landed = url, None, False
+            for hop in range(MAX_HOPS + 1):
+                nav.clear()
+                try:
+                    response = await page.goto(target, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                    landed = True
+                    break
+                except Exception as exc:  # noqa: BLE001 - unreachable, DNS, timeout, or a redirect we took over
+                    if "refused" in nav:
+                        return PageResult(url=url, final_url=nav["refused"], ok=False, partial=True,
+                                          confidence=0.0, elapsed_s=time.monotonic() - start,
+                                          error=f"redirected to another origin ({_host_of(nav['refused'])}); refused")
+                    if "redirect" not in nav:
+                        return PageResult(url=url, ok=False, partial=True, confidence=0.0,
+                                          error=f"navigation failed: {type(exc).__name__}: {str(exc)[:300]}",
+                                          elapsed_s=time.monotonic() - start)
+                    target = nav["redirect"]
+                    if hop == MAX_HOPS:
+                        break
+                    # The aborted hop sends this tab to Chromium's error page,
+                    # and that navigation would interrupt the next goto: use
+                    # a fresh tab in the same (guarded) context.
+                    await page.close()
+                    page = await context.new_page()
+                    if not await self._robots_allows(context, target):
+                        return PageResult(url=url, final_url=target, ok=False, partial=True, confidence=0.0,
+                                          error="redirect target disallowed by robots.txt",
+                                          elapsed_s=time.monotonic() - start)
+            if not landed:
+                return PageResult(url=url, final_url=target, ok=False, partial=True, confidence=0.0,
+                                  error=f"more than {MAX_HOPS} redirects", elapsed_s=time.monotonic() - start)
             if _host_of(page.url) != page_host:
                 return PageResult(url=url, final_url=page.url, ok=False, partial=True, confidence=0.0,
                                   error=f"redirected to another origin ({_host_of(page.url)}); refused",
@@ -351,7 +505,7 @@ class BrowserBackend:
                 await asyncio.wait_for(context.close(), timeout=10)
             except Exception as exc:  # noqa: BLE001 - a wedged renderer: drop this browser
                 log(f"context close failed ({exc!r}); browser will be relaunched")
-                self._browser = None
+                await self._drop_browser()  # stops the old driver too (review 2, L5)
             finally:
                 self.open_contexts -= 1
 

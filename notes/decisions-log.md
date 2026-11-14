@@ -358,3 +358,46 @@ non-default port, so http->https upgrades stay same-site.
 first URL of a redirect chain, so a public or same-origin URL could bounce a
 request into the LAN. Proven by a test with a real HTTP 302 from the page's
 own origin, plus a negative control where the 302 lands.
+
+## D-029 — "Still stated" refined again: forbidden continuations, label words (refines D-027)
+
+**Chose:** the right anchor is what may NOT follow a stored fact: more
+letters or digits, a decimal, a thousands/range/list continuation (",", "-",
+"/", "&", "and"). Anything else may follow, so "2 years" in "2 years
+full-time" still matches. An identical extraction is unchanged however short
+("65"). A re-worded numeric extraction is unchanged only when its numbers
+are the same IN THE SAME ORDER and its words are the same once pure labels
+("fee", "tuition", "AUD", "the"...) are dropped.
+**Rejected:** D-027's sentence-end anchor (phrase facts read as "modified")
+and its 75% mutual word overlap.
+**Why:** second delta review. H1: overlap hid "domestic" -> "international",
+"per year" -> "per semester", "refundable" -> "not refundable" and two
+swapped values. M3/M4: short and phrase-shaped facts never matched, so
+unchanged pages reported changes.
+
+## D-030 — Browser boundary, second pass
+
+**Chose:**
+- Hosts are canonicalised the way browsers do (WHATWG IPv4 parser):
+  2130706433, 0x7f000001, 127.1 and 017700000001 are 127.0.0.1;
+  IPv4-mapped IPv6 is its IPv4.
+- A host NAME other than the page's own is resolved first. Any private
+  answer, or no answer, blocks it.
+- A 3xx is never fulfilled to the browser. When the hops run out, the
+  request is aborted.
+- The main-frame navigation's redirects are handed back to open_page,
+  which navigates to the next hop itself (robots-checked), so page.url and
+  relative links are right.
+- A redirected non-GET request is refused, not re-sent.
+- An unreachable or 5xx robots.txt is cached for 5 minutes, not forever.
+- A wedged renderer drops the whole browser and its driver.
+
+**Rejected:** relying on `ipaddress` alone; resolving DNS inside a pinned
+resolver; following 301/302/303 as a GET without a body.
+- A pinned resolver is not possible through Playwright's route API.
+- For a GET without a body, there is no verified way to drop the body via
+  route.fetch, and refusing is the fail-closed choice.
+
+**Why:** second delta review H2, M1, M2, L5, L6.
+**Residual:** DNS rebinding between our lookup and the fetch's own lookup is
+not closed. It is noted in the security audit.
