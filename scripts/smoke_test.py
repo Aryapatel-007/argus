@@ -23,12 +23,13 @@ def main() -> None:
 
     models = config["models"]
     ollama_cfg = config["ollama"]
-    client = Client(host=ollama_cfg["host"])
+    client = Client(host=ollama_cfg["host"], timeout=120)  # CLAUDE.md: hard 120s
 
     try:
         chat_response = client.chat(
             model=models["chat"],
             messages=[{"role": "user", "content": CHAT_PROMPT}],
+            think=False,  # top-level, explicit: thinking on is unbounded (audit L14)
             options={"num_ctx": ollama_cfg["num_ctx"]},
         )
 

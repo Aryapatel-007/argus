@@ -78,6 +78,18 @@ def fake_observe(ctx: RunContext, conn: Any = None) -> Dict[str, Any]:
     from argus.orchestrator import tools
 
     action = ctx.last_action or {}
+    # Second line of defence for audit C1 (review M-2): PLAN routes external
+    # actions to GATE, but this is the one place a tool actually executes, so
+    # it refuses an external tool itself. Covers an ACT that rewrote the tool,
+    # and a run checkpointed at ACT/OBSERVE before the C1 fix was deployed.
+    # The legacy loop never executes approved actions; the graph engine does.
+    if tools.is_external(action.get("tool"), action.get("externally_visible")):
+        return {
+            "ok": False,
+            "tool": action.get("tool"),
+            "content": "",
+            "error": "refused: external tool requires an approved approvals row",
+        }
     return tools.run_tool(action.get("tool"), action.get("args", {}))
 
 

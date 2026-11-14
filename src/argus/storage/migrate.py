@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, List
 
@@ -74,10 +76,67 @@ def _is_no_transaction(sql: str) -> bool:
     return first_line == NO_TRANSACTION_MARKER
 
 
+#: How long a second migrator waits for the first before giving up.
+LOCK_TIMEOUT_S = 120.0
+
+
+@contextmanager
+def _migration_lock(db_path: db.PathLike) -> Iterator[None]:
+    """Serialise migrators across processes with an OS file lock.
+
+    Review H-1: re-checking schema_migrations inside each file's transaction
+    was not enough. Two processes opening a FRESH file race on
+    `PRAGMA journal_mode = WAL` inside db.connect() and the loser fails with
+    "database is locked" before any re-check runs; and the no-transaction
+    path (001c) cannot be protected by a transaction at all. One lock around
+    the whole migration, connect included, covers both.
+    """
+    lock_path = Path(str(db_path) + ".migrate.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
+    deadline = time.monotonic() + LOCK_TIMEOUT_S
+    try:
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"another process holds {lock_path}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def apply_migrations(
     db_path: db.PathLike = db.DB_PATH, migrations_dir: Path = MIGRATIONS_DIR
 ) -> List[str]:
     """Apply every migration not yet recorded. Returns the filenames applied."""
+    with _migration_lock(db_path):
+        return _apply_locked(db_path, migrations_dir)
+
+
+def _apply_locked(db_path: db.PathLike, migrations_dir: Path) -> List[str]:
     applied: List[str] = []
 
     with db.connect(db_path) as conn:
@@ -98,6 +157,14 @@ def apply_migrations(
                 )
             else:
                 with db.atomic(conn):
+                    # Audit M5: re-check under the write lock. `already` was
+                    # read before any lock, so a second process starting at the
+                    # same moment would otherwise re-run a file the first one
+                    # just applied and die on "table already exists".
+                    if conn.execute(
+                        "SELECT 1 FROM schema_migrations WHERE filename = ?", (path.name,)
+                    ).fetchone():
+                        continue
                     for statement in _statements(sql):
                         conn.execute(statement)
                     conn.execute(

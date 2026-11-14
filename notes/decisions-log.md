@@ -87,3 +87,49 @@ already holds. The independence rules are where delegation pays: audit,
 review of crash-resume/approval/transaction/router diffs, and skill vetting
 go to agents that did not write the code. Implementation that needs the
 whole design in mind stays in the main session.
+
+## D-008 — Run leases: pid is truth on the same host, staleness only across hosts
+
+**Chose:** a `run_leases` row per run, owner `host:pid:random`, ownership
+re-checked inside every step transaction with a rowcount check, plus a UNIQUE
+(run_id, step_index) index as an independent backstop. On the same host a
+live pid keeps the lease no matter how stale its heartbeat is; a dead pid is
+taken over at once. Staleness (120s) decides only for an owner on another
+host.
+**Rejected:** heartbeat staleness alone (a single legitimate step can last
+240s: two planner attempts at the 120s timeout, so any fixed window either
+steals live runs or makes crash-resume wait); a background heartbeat thread
+(sqlite connections are thread-affine, and it would keep a hung process's
+lease alive forever).
+**Why:** review H-2 showed the first version would hand a slow live run to a
+second `--resume`. Access-denied from OpenProcess reads as alive (review M-1).
+
+## D-009 — `importance` is written now, scored in Phase E
+
+**Chose:** `remember_fact` accepts and stores `importance` (0-1) from Phase C
+on; the recall scorer starts using it in Phase E step 6.9, with its own tests
+replacing the test that pins its absence.
+**Rejected:** keeping it NULL until "Sprint 5".
+**Why:** ARGUS_BUILD.md 6.9 makes importance part of the build, and the
+`write_fact` node assigns it. Storing it from the first write means no facts
+exist without it when scoring turns on. The CLAUDE.md "stays NULL until
+Sprint 5" line predates the directive (reviewer flagged the mismatch, M-4).
+
+## D-010 — One migration file per concern
+
+**Chose:** 003 run leases, 004 remember receipts, then separate files for the
+graph tables, the model/learning tables, and the llm_calls widening.
+**Rejected:** one large 003.
+**Why:** each file stays transactional and reviewable on its own, and a
+failure in one concern cannot block the others. The memory server can then
+require exactly the files it reads (002, 004).
+
+## D-011 — Migrations are serialised by an OS file lock
+
+**Chose:** `apply_migrations` holds `<db>.migrate.lock` (msvcrt on Windows,
+flock elsewhere) around the whole run, connect included, and also re-checks
+`schema_migrations` inside each file's transaction.
+**Rejected:** the in-transaction re-check alone.
+**Why:** review H-1 measured two processes racing on the very first
+`PRAGMA journal_mode = WAL` of a fresh file, before any transaction exists,
+and the no-transaction path (001c) cannot be protected by a transaction.

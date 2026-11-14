@@ -3,7 +3,9 @@
 Transition table (see `_dispatch`):
 
     INIT     -> PLAN     always
-    PLAN     -> ACT      action non-null
+    PLAN     -> ACT      action non-null and internal
+    PLAN     -> GATE     action external (tool's static flag OR planner's flag);
+                         the tool has NOT run (audit C1)
     PLAN     -> DONE     planner set done=true
     PLAN     -> PLAN     parse failure, parse_retries < 2
     PLAN     -> FAILED   parse_retries >= 2
@@ -12,8 +14,9 @@ Transition table (see `_dispatch`):
     CRITIQUE -> GATE     verdict == pass
     CRITIQUE -> ACT      verdict == fail and attempt_count < MAX_ATTEMPTS
     CRITIQUE -> FAILED   verdict == fail and attempt_count >= MAX_ATTEMPTS
-    GATE     -> PERSIST  not externally_visible
-    GATE     -> FAILED   externally_visible (Sprint 5 stub)
+    GATE     -> PERSIST  internal (reached from CRITIQUE)
+    GATE     -> FAILED   external (reached from PLAN): approvals row queued,
+                         task failed, tool never executed
     PERSIST  -> PLAN     tasks remain
     PERSIST  -> DONE     no tasks remain
 
@@ -37,6 +40,7 @@ STEP INDEX INVARIANT
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -53,7 +57,7 @@ from argus.orchestrator.state import (
     TERMINAL_STATES,
     State,
 )
-from argus.storage import db
+from argus.storage import db, lease
 
 #: Two different runaway modes get two different guards, not one global step
 #: cap: a single fixed number conflates "the planner won't stop making tasks"
@@ -244,6 +248,13 @@ def _on_plan(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, Li
 
     if ctx.last_action is None:
         return State.DONE, ops
+
+    # Audit C1: an external action goes to GATE BEFORE ACT/OBSERVE, because
+    # OBSERVE is where the tool actually runs. Checking at GATE after CRITIQUE
+    # (the Sprint 1 order) meant the tool had already executed, up to
+    # MAX_ATTEMPTS times, by the time anything asked for approval.
+    if tools.is_external(ctx.last_action.get("tool"), ctx.last_action.get("externally_visible")):
+        return State.GATE, ops
     return State.ACT, ops
 
 
@@ -290,18 +301,45 @@ def _on_critique(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State
 
 def _on_gate(ctx: RunContext, stubs: Stubs, conn: Any = None) -> Tuple[State, List[DbOp]]:
     action = ctx.last_action or {}
-    if action.get("externally_visible"):
-        # Sprint 5 replaces this with AWAIT_APPROVAL + a row in `approvals`.
-        # The branch exists now so it is reachable and loggable rather than
-        # being retrofitted into a loop that never had a place for it.
+    if tools.is_external(action.get("tool"), action.get("externally_visible")):
+        # Reached from PLAN, before the tool has run (audit C1). The legacy
+        # loop cannot wait for a human, so it queues the approval row and
+        # ends the run. The graph engine (src/argus/graph) blocks properly and
+        # executes after approval; this path exists only so the linear loop
+        # can never run an external tool unapproved.
+        task_id = ctx.current_task["task_id"] if ctx.current_task else None
+        ops: List[DbOp] = [
+            (
+                "INSERT INTO approvals (idempotency_key, target_id, action_kind, "
+                "proposed_action, reasoning, status, created_run_id, created_task_id) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?) "
+                # Only the idempotency key may absorb a replay; a NOT NULL or
+                # CHECK violation must still raise (review L-1).
+                "ON CONFLICT (idempotency_key) DO NOTHING",
+                (
+                    # Deterministic per (run, task): a resumed step re-issues
+                    # the same key and the UNIQUE constraint absorbs it.
+                    f"legacy:{ctx.run_id}:{task_id}",
+                    ctx.target_id,
+                    str(action.get("tool")),
+                    json.dumps(
+                        {"tool": action.get("tool"), "args": action.get("args", {})},
+                        sort_keys=True,
+                    ),
+                    "linear loop: action declared external by the tool or the planner",
+                    ctx.run_id,
+                    task_id,
+                ),
+            )
+        ]
         ctx.reflections.append(
-            "action is externally visible; blocked pending approval "
-            "(Sprint 5 stub: failing instead of awaiting)"
+            "action is externally visible; approval queued, tool NOT run "
+            "(legacy loop cannot wait, so the run ends here)"
         )
-        return State.FAILED, _terminate_task(
+        return State.FAILED, ops + _terminate_task(
             ctx,
             TASK_STATUS_FAILED,
-            "externally visible action requires approval (Sprint 5)",
+            "externally visible action requires approval; queued, not executed",
         )
     return State.PERSIST, []
 
@@ -362,8 +400,16 @@ def step(
     conn: Optional[sqlite3.Connection] = None,
     db_path: Optional[db.PathLike] = None,
     stubs: Stubs = DEFAULT_STUBS,
+    lease_owner: Optional[str] = None,
 ) -> RunContext:
     """Advance one transition and checkpoint it, atomically.
+
+    `lease_owner` (audit H2): when given, the step's transaction also proves
+    this process still owns the run (heartbeat UPDATE with a rowcount check),
+    or inserts the lease for a brand-new run in the same transaction as its
+    runs row. A process that lost the lease raises LeaseLost and commits
+    nothing. None keeps the Sprint 1 behaviour for tests that drive the loop
+    in-process without a lease.
 
     The state change on the context and the checkpoint row recording it are
     written in ONE transaction. A crash between them is therefore impossible:
@@ -374,6 +420,7 @@ def step(
         raise ValueError(f"cannot step a terminated run (state={ctx.state.value})")
 
     entry_index = ctx.step_index
+    entry_state = ctx.state
     task_before = ctx.current_task["task_id"] if ctx.current_task else None
 
     # The connection is opened BEFORE dispatch, not after, because dispatch is
@@ -414,6 +461,12 @@ def step(
             for sql, params in ops:
                 active.execute(sql, params)
 
+            if lease_owner is not None:
+                if entry_state is State.INIT:
+                    lease.insert_initial(active, ctx.run_id, lease_owner)
+                else:
+                    lease.assert_held(active, ctx.run_id, lease_owner)
+
             active.execute(
                 "INSERT INTO checkpoints "
                 "(checkpoint_id, run_id, task_id, step_index, state, payload) "
@@ -447,6 +500,7 @@ def run_to_completion(
     db_path: Optional[db.PathLike] = None,
     stubs: Stubs = DEFAULT_STUBS,
     max_steps: Optional[int] = None,
+    lease_owner: Optional[str] = None,
 ) -> RunContext:
     """Step until terminal, or until `max_steps` steps have been taken here.
 
@@ -459,7 +513,7 @@ def run_to_completion(
         while ctx.state not in TERMINAL_STATES:
             if max_steps is not None and taken >= max_steps:
                 break
-            step(ctx, conn=active, stubs=stubs)
+            step(ctx, conn=active, stubs=stubs, lease_owner=lease_owner)
             taken += 1
     return ctx
 

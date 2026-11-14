@@ -9,3 +9,5 @@ data/
 .hypothesis/
 .pytest_cache/
 *.log
+*.migrate.lock
+src/*.egg-info/

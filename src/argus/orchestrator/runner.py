@@ -18,7 +18,7 @@ if __package__ in (None, ""):  # direct-script execution
 
 from argus.orchestrator import loop  # noqa: E402
 from argus.orchestrator.state import State  # noqa: E402
-from argus.storage import db  # noqa: E402
+from argus.storage import db, lease  # noqa: E402
 from argus.storage.migrate import apply_migrations  # noqa: E402
 
 
@@ -46,10 +46,25 @@ def main(argv=None) -> int:
     db_path = Path(args.db) if args.db else db.DB_PATH
     apply_migrations(db_path)
 
+    owner = lease.new_owner()
     with db.connect(db_path) as conn:
         if args.target:
             ctx = loop.new_run(args.target)
         else:
+            if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (args.resume,)).fetchone() is None:
+                print(f"no run with run_id {args.resume!r}", file=sys.stderr)
+                return 2
+            # Audit H2: refuse to drive a run another live process owns.
+            # Acquire BEFORE loading the checkpoint (review M-3): loading first
+            # lets the previous owner commit one more step in between, and we
+            # would replay a step that is already done.
+            if not lease.acquire(conn, args.resume, owner):
+                print(
+                    f"run {args.resume} is leased to {lease.current_owner(conn, args.resume)}, "
+                    f"which is still alive; not resuming",
+                    file=sys.stderr,
+                )
+                return 3
             ctx = loop.load_latest_checkpoint(args.resume, conn=conn)
             if ctx is None:
                 print(f"no checkpoints found for run_id {args.resume!r}", file=sys.stderr)
@@ -59,7 +74,9 @@ def main(argv=None) -> int:
                 return _report(ctx)
             print(f"resuming {args.resume} from step {ctx.step_index} ({ctx.state.value})")
 
-        loop.run_to_completion(ctx, conn=conn)
+        loop.run_to_completion(ctx, conn=conn, lease_owner=owner)
+        if ctx.state in loop.TERMINAL_STATES:
+            lease.release(conn, ctx.run_id, owner)
 
     return _report(ctx)
 

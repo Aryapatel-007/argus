@@ -5,14 +5,14 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** C (audit and critical fixes) — next
-- **Last completed:** Phase B, agent team
-- **Test count:** 179 passing (baseline before Phase A: 179). Must never drop.
+- **Phase:** E (graph engine), step 1-3 written, not yet committed
+- **Last completed:** Phase D, testing and audit skills
+- **Test count:** 230 at the Phase D commit (179 at baseline). Must never drop.
 - **Blocked:** no
 
 ## Phase log
 
-### Phase A — done (2026-11-14)
+### Phase A — done (2026-11-14), commit e90c596
 
 - Installed and pinned: playwright 1.65.2 (+ Chromium headless shell),
   apscheduler 3.11.3, fastapi 0.162.7, jinja2 3.1.6, pytest 9.2.0,
@@ -20,26 +20,76 @@ then ARGUS_BUILD.md.
   mcp 2.0.0, sqlite-vec 0.1.9, ollama 0.6.2, httpx 0.28.1, uvicorn 0.52.4.
 - Rejected after reading the wheels: browser-use (D-002), deepeval (D-004),
   streamlit (D-003). Browser server will be raw Playwright.
-- `pytest.ini` added; pytest and unittest both report 179.
-- Versions, models, disk: `notes/environment.md`. Disk: C: 74.8 GB free.
-- CLAUDE.md trimmed 285 -> 222 lines; Sprint 2 state moved to the end of
-  notes/sprint-2.md. Install-up-front and decide-yourself rules recorded.
+- Versions, models, disk: `notes/environment.md`.
 - ARGUS_BUILD.md saved into the repo so later sessions can re-read it.
 
-### Phase B — done (2026-11-14)
+### Phase B — done (2026-11-14), commit 3a7d52d
 
-- Frontmatter confirmed via claude-code-guide against the docs: `name`,
-  `description` required; `model: opus`, `effort: medium|high|xhigh`,
-  `tools`, `disallowedTools`. Unknown fields are silently ignored.
-- 10 agents in `.claude/agents/`. Usage policy: D-007. Agents defined
-  mid-session may not be listed until the next session starts; if an agent
-  type is missing, run the same prompt through general-purpose and say so.
+- 10 agents in `.claude/agents/` (Opus; effort medium/high/xhigh). Usage
+  policy D-007. Project agents load only at session start: in the session
+  that created them, run their prompts through general-purpose with the
+  agent's file as instructions and the same effort.
+
+### Phase C — done (2026-11-14)
+
+- Audit: `notes/audit.md` (1 critical, 3 high, 8 medium, 15 low).
+- Fixed C1, H1, H2, H3 plus M1, M4, M5, L2, L3, L14. Reviewer pass found 2
+  high + 5 medium problems in those fixes; all fixed. Fix table at the end of
+  notes/audit.md. Decisions D-008 to D-011.
+- New: migrations 003 (run leases, unique checkpoint index) and 004 (remember
+  receipts); `storage/lease.py`; `pyproject.toml` + editable install
+  (`pip install -e .`); `argus` CLI stub.
+- Writer think probe written up: `notes/writer-probe-results.md` (closed:
+  stay on think=False).
+- Tests: 211 at the Phase C commit.
+
+### Phase D — done (2026-11-14)
+
+- Installed Trail of Bits `property-based-testing` (commit 149d7b21, effort
+  raised low->medium). Rejected Cloudflare security-audit-skill and 4 others.
+  Details: `notes/skills.md`.
+- Wrote project skills: argus-security-audit (+ `scripts/security_scan.py`),
+  argus-agentic-testing, argus-mcp-testing, argus-mutation-check
+  (+ `scripts/mutation_check.py`).
+- Security scan: 0 blocking. Mutation check: all mutants killed (it caught
+  one vacuous test: `atomic()` could not tell BEGIN from BEGIN IMMEDIATE).
+- Tests: 230 at the Phase D commit.
+
+## Phase E progress
+
+Spec: `notes/specs/graph-engine.md`. Package `src/argus/graph/`.
+
+| Step | Status |
+|---|---|
+| 1 node type registry | written (`graph/nodes.py`), committed with step 3 |
+| 2 graph model + migration | model written (`graph/model.py`); migrations 005-007 not yet |
+| 3 validator + property tests | written (`graph/validator.py`, `templates.py`, `tests/test_graph_validator.py`, 23 tests incl. 2 negative controls) |
+| 4-12 | not started |
+
+Model pool (decided, D-012 pending in log): qwen3.5:9b, phi4-mini,
+llama3.1:8b, gemma4:e4b (profiler decides if it is usable), nomic-embed-text.
+New pulls (gemma3:4b, qwen3.5:2b) FAIL on Ollama 0.24.0 ("download the latest
+version"). Not upgrading the engine mid-build; question for Arya at the end.
 
 ## Next steps
 
-1. Phase C: auditor -> notes/audit.md; fix critical/high. Also write up the
-   writer think probe (`notes/writer-probe-raw.json`, untracked until then).
+1. Commit Phase E steps 1+3 (graph nodes, model, templates, validator, tests).
+2. Step 2: migrations 005_graph.sql, 006_models.sql, 007_llm_calls_graph.sql
+   + `graph/store.py`.
+3. Step 4: `config/models.yaml`, `graph/registry.py`,
+   `scripts/profile_models.py`; run the profiler on the real pool.
+4. Steps 5-12 per ARGUS_BUILD.md 6.10.
 
-## Backlog (medium/low, from audits)
+## Backlog (medium/low)
 
-(empty until Phase C)
+From notes/audit.md, not fixed: M2 (ctx mutated before commit), M3 (one
+failed task fails the run), M6 (log_call failure kills the step), M7
+(untyped memory-server errors), M8 (sync sqlite in async tools), L1, L4-L13,
+L15; review L-4 (H1 negative control is query-level), L-7. Most of M2/M3/L4/
+L7 are superseded by the graph engine.
+
+## Questions for Arya (non-blocking)
+
+- Upgrade Ollama 0.24.0 -> 0.40.x? Needed to pull newer small models
+  (qwen3.5:2b, gemma3:4b). Would invalidate earlier measurements; the
+  profiler would be re-run.

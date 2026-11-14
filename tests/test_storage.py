@@ -26,10 +26,13 @@ EXPECTED_TABLES = {
     "schema_migrations", "runs", "tasks", "checkpoints", "llm_calls",
     # 002
     "facts", "facts_vec", "approvals",
+    # 003, 004 (Phase C audit fixes H2, H3)
+    "run_leases", "remember_receipts",
 }
 EXPECTED_MIGRATIONS = [
     "001_initial.sql", "001b_task_columns.sql", "001c_lock_schema.sql",
     "002_facts_approvals.sql",
+    "003_run_leases.sql", "004_remember_receipts.sql",
 ]
 
 #: Fixed by nomic-embed-text. Not a tunable — see 002_facts_approvals.sql.
@@ -268,7 +271,8 @@ class TestPost001cSchema(StorageTestCase):
 
         self.assertEqual(
             apply_migrations(self.db_path),
-            ["001c_lock_schema.sql", "002_facts_approvals.sql"],
+            # Everything after 001b, in order (001c, 002, then any later file).
+            EXPECTED_MIGRATIONS[EXPECTED_MIGRATIONS.index("001c_lock_schema.sql"):],
         )
         self.assertNotIn("idempotency_key", task_columns(self.db_path))
 
@@ -670,7 +674,10 @@ class TestLlmCallsEmbedderRole(Migration002TestCase):
                  110, 88, 4_000_000_000, 22.0, 1),
             )
 
-        self.assertEqual(apply_migrations(legacy), ["002_facts_approvals.sql"])
+        self.assertEqual(
+            apply_migrations(legacy),
+            EXPECTED_MIGRATIONS[EXPECTED_MIGRATIONS.index("002_facts_approvals.sql"):],
+        )
 
         with db.connect(legacy) as conn:
             row = conn.execute(
@@ -943,6 +950,43 @@ class TestBeginImmediate(Migration002TestCase):
             conn.close()
 
         self.assertGreater(elapsed, self.BUSY_MS / 1000 / 2, f"{elapsed:.3f}s")
+
+    def test_atomic_read_then_write_waits_instead_of_failing_instantly(self) -> None:
+        """Phase D mutation check found the test above cannot tell BEGIN from
+        BEGIN IMMEDIATE: a write-first body takes the lock through the busy
+        handler either way. The bug only bites a body that READS first and
+        then writes (the upgrade path). With BEGIN IMMEDIATE the wait happens
+        at BEGIN, bounded by the timeout; with a deferred BEGIN the upgrade
+        fails instantly. This test drives exactly that body through atomic().
+        """
+        with self._write_lock_held():
+            conn = self._connection()
+            start = time.perf_counter()
+            with self.assertRaises(sqlite3.OperationalError):
+                with db.atomic(conn):
+                    conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+                    conn.execute(
+                        "INSERT INTO runs (run_id, target_id, status) VALUES (?, ?, ?)",
+                        ("run-atomic-rw", "t", "running"),
+                    )
+            elapsed = time.perf_counter() - start
+            conn.close()
+
+        self.assertGreater(
+            elapsed, self.BUSY_MS / 1000 / 2,
+            f"read-then-write inside atomic() failed after {elapsed:.3f}s; "
+            f"a deferred BEGIN fails instantly, BEGIN IMMEDIATE waits",
+        )
+
+    def test_atomic_issues_begin_immediate_literally(self) -> None:
+        """Belt and braces: trace the SQL atomic() actually sends."""
+        conn = self._connection()
+        sent: "list[str]" = []
+        conn.set_trace_callback(sent.append)
+        with db.atomic(conn):
+            conn.execute("SELECT 1").fetchone()
+        conn.close()
+        self.assertEqual(sent[0].strip().upper(), "BEGIN IMMEDIATE", sent)
 
 
 class TestConcurrentWriters(Migration002TestCase):

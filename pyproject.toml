@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus"
+version = "0.3.0"
+description = "Local-first autonomous multi-agent monitoring system"
+requires-python = ">=3.11"
+
+[project.scripts]
+argus = "argus.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"argus" = ["**/*.sql", "**/*.md", "**/*.html", "**/*.css"]

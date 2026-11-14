@@ -52,8 +52,10 @@ from argus.storage import db  # noqa: E402
 
 SERVER_NAME = "argus-memory"
 
-#: The server refuses to start unless this migration is recorded as applied.
-REQUIRED_MIGRATION = "002_facts_approvals.sql"
+#: The server refuses to start unless every one of these is recorded as
+#: applied. REQUIRED_MIGRATION is the newest, named in error messages.
+REQUIRED_MIGRATIONS = ("002_facts_approvals.sql", "004_remember_receipts.sql")
+REQUIRED_MIGRATION = REQUIRED_MIGRATIONS[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +133,15 @@ class EmptyQueryError(ValueError):
     """
 
 
+class IdempotencyKeyReuseError(ValueError):
+    """A remember_fact idempotency key was reused for a different fact."""
+
+
+class _NeedsEmbedding(Exception):
+    """Internal: the in-transaction read needs a vector the advisory read did
+    not compute (audit H1). Raised inside db.atomic() so it rolls back."""
+
+
 class InvalidTimestampError(ValueError):
     """Raised when `since` is not an unambiguous, UTC, ISO 8601 timestamp.
 
@@ -195,9 +206,10 @@ def assert_migrated(db_path: Path) -> None:
         ) from exc
 
     applied = {row["filename"] for row in rows}
-    if REQUIRED_MIGRATION not in applied:
+    missing = [m for m in REQUIRED_MIGRATIONS if m not in applied]
+    if missing:
         raise SystemExit(
-            f"{SERVER_NAME}: required migration {REQUIRED_MIGRATION} is not applied "
+            f"{SERVER_NAME}: required migration(s) {', '.join(missing)} not applied "
             f"to {db_path}.\n"
             f"Applied: {sorted(applied) or '(none)'}\n"
             f"This server does not run migrations - that is the orchestrator's job. "
@@ -383,6 +395,8 @@ class MemoryServer:
         attributes: Optional[dict] = None,
         source_url: Optional[str] = None,
         confidence: float = 1.0,
+        importance: Optional[float] = None,
+        idempotency_key: Optional[str] = None,
     ) -> RememberResult:
         """Record a fact, resolving to added / modified / unchanged.
 
@@ -395,6 +409,27 @@ class MemoryServer:
         against today (see TestConcurrentRememberFact in
         tests/test_memory_server.py for the proof this holds under real
         overlap).
+
+        Audit H1: the advisory read can be STALE (another process wrote the
+        same entity in between). If the authoritative read inside the
+        transaction says a new row is needed but no vector was computed, the
+        transaction is abandoned without writing, the content is embedded
+        outside any transaction, and the decision is re-made. A fact version
+        is never inserted without its facts_vec row.
+
+        Audit H3: `idempotency_key` makes a repeated call (a caller that
+        crashed after this commit and resumed) return the first call's result
+        byte for byte and write nothing. The receipt is written in the SAME
+        transaction as the fact.
+
+        `importance` (0-1, assigned by a model at write time) is stored on the
+        new row. ARGUS_BUILD.md 6.9 brings it into the recall scorer in Phase
+        E (D-009); until that lands it is stored only. It is not part of the
+        content hash: re-scoring importance alone is not a change to the fact.
+
+        A receipt is scoped to (target_id, entity_key): reusing a key for a
+        different fact raises instead of silently returning another fact's
+        result (review M-5).
         """
         if not content or not content.strip():
             raise EmptyContentError(
@@ -404,9 +439,10 @@ class MemoryServer:
                 "rather than stored. Pass the actual extracted text, or do not "
                 "call remember_fact at all if there is nothing to record."
             )
+        if importance is not None and not (0.0 <= importance <= 1.0):
+            raise ValueError(f"importance must be in [0, 1], got {importance}")
 
         digest = content_hash(content, attributes)
-        now = utcnow_iso()
 
         # One connection per call, NOT one shared by the server. Two concurrent
         # remember_fact invocations must be able to hold two separate
@@ -415,39 +451,27 @@ class MemoryServer:
         # because the `await` on the embed below yields the event loop and lets
         # a second invocation reach BEGIN IMMEDIATE while the first is open.
         with db.connect(self.db_path) as conn:
+            if idempotency_key:
+                receipt = self._receipt(conn, idempotency_key, target_id, entity_key)
+                if receipt is not None:
+                    return receipt
+
             # A cheap read OUTSIDE the transaction, used only to decide whether
             # an embedding is needed. It is deliberately NOT trusted for the
             # write decision - it is re-read inside the transaction below.
-            # Reading here is safe because the worst case is embedding a vector
-            # we end up not needing, which costs ~0.9s and nothing else.
             existing = self._current_row(conn, target_id, entity_key)
 
             vector_blob = None
             if existing is None or existing["content_hash"] != digest:
                 # Embed BEFORE opening the transaction. CLAUDE.md: never hold a
-                # transaction open across an Ollama call - the write lock is
-                # database-wide and an embed takes ~0.9s, which would block the
-                # orchestrator process for that whole time.
-                vector = await embeddings.embed(
-                    content.strip(), run_id=self.run_id, conn=conn
-                )
-                vector_blob = embeddings.serialize(vector)
+                # transaction open across an Ollama call.
+                vector_blob = await self._embed_blob(content, conn)
 
-            # THE transaction. The current-row lookup is repeated inside it and
-            # that repetition is the point: the read and the write must be one
-            # atomic unit. If the lookup outside were trusted, two concurrent
-            # calls for the same (target_id, entity_key) could both read "no
-            # current row", both decide 'added', and both INSERT with
-            # is_current=1 - which the partial unique index would reject as an
-            # IntegrityError, turning a benign race into a caller-visible
-            # failure. Re-reading under BEGIN IMMEDIATE means the second caller
-            # sees the first caller's committed row and correctly resolves to
-            # 'unchanged' or 'modified' instead.
-            with db.atomic(conn):
-                current = self._current_row(conn, target_id, entity_key)
-
-                if current is None:
-                    return self._insert_new(
+            # At most two passes: the second always has a vector, so it can
+            # never need to leave the transaction again.
+            for _ in range(2):
+                try:
+                    return self._write_decision(
                         conn,
                         target_id=target_id,
                         entity_key=entity_key,
@@ -456,38 +480,57 @@ class MemoryServer:
                         digest=digest,
                         source_url=source_url,
                         confidence=confidence,
-                        now=now,
+                        importance=importance,
                         vector_blob=vector_blob,
-                        version=1,
-                        supersedes_id=None,
-                        change_kind="added",
+                        idempotency_key=idempotency_key,
                     )
+                except _NeedsEmbedding:
+                    vector_blob = await self._embed_blob(content, conn)
+            raise RuntimeError("remember_fact: write decision did not converge")
 
-                if current["content_hash"] == digest:
-                    # Unchanged. Touch last_seen_* on the EXISTING row and stop.
-                    # No new row, no re-embed - the vector cannot have changed
-                    # if the content hash did not.
-                    conn.execute(
-                        "UPDATE facts SET last_seen_run_id = ?, last_seen_at = ? "
-                        "WHERE fact_id = ?",
-                        (self.run_id, now, current["fact_id"]),
-                    )
-                    return RememberResult(
-                        fact_id=current["fact_id"],
-                        change_kind="unchanged",
-                        version=current["version"],
-                        previous_fact_id=None,
-                    )
+    async def _embed_blob(self, content: str, conn: sqlite3.Connection) -> bytes:
+        vector = await embeddings.embed(content.strip(), run_id=self.run_id, conn=conn)
+        return embeddings.serialize(vector)
 
-                # Modified: retire the old row, then insert the new version.
-                # Order matters - the partial unique index permits exactly one
-                # is_current=1 row per (target_id, entity_key), so the old row
-                # must be cleared before the new one lands.
-                conn.execute(
-                    "UPDATE facts SET is_current = 0 WHERE fact_id = ?",
-                    (current["fact_id"],),
-                )
-                return self._insert_new(
+    def _write_decision(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        target_id: str,
+        entity_key: str,
+        content: str,
+        attributes: Optional[dict],
+        digest: str,
+        source_url: Optional[str],
+        confidence: float,
+        importance: Optional[float],
+        vector_blob: Optional[bytes],
+        idempotency_key: Optional[str],
+    ) -> RememberResult:
+        """THE transaction. Raises _NeedsEmbedding (rolling back, nothing
+        written) when a new row is needed and no vector is in hand.
+
+        The current-row lookup is repeated inside the transaction and that
+        repetition is the point: the read and the write must be one atomic
+        unit. Re-reading under BEGIN IMMEDIATE means a second concurrent
+        caller sees the first caller's committed row and resolves to
+        'unchanged' or 'modified' instead of colliding on the partial unique
+        index.
+        """
+        now = utcnow_iso()
+        with db.atomic(conn):
+            if idempotency_key:
+                receipt = self._receipt(conn, idempotency_key, target_id, entity_key)
+                if receipt is not None:
+                    return receipt
+
+            current = self._current_row(conn, target_id, entity_key)
+            needs_new_row = current is None or current["content_hash"] != digest
+            if needs_new_row and vector_blob is None:
+                raise _NeedsEmbedding()
+
+            if current is None:
+                result = self._insert_new(
                     conn,
                     target_id=target_id,
                     entity_key=entity_key,
@@ -496,6 +539,47 @@ class MemoryServer:
                     digest=digest,
                     source_url=source_url,
                     confidence=confidence,
+                    importance=importance,
+                    now=now,
+                    vector_blob=vector_blob,
+                    version=1,
+                    supersedes_id=None,
+                    change_kind="added",
+                )
+            elif current["content_hash"] == digest:
+                # Unchanged. Touch last_seen_* on the EXISTING row and stop.
+                # No new row, no re-embed - the vector cannot have changed
+                # if the content hash did not.
+                conn.execute(
+                    "UPDATE facts SET last_seen_run_id = ?, last_seen_at = ? "
+                    "WHERE fact_id = ?",
+                    (self.run_id, now, current["fact_id"]),
+                )
+                result = RememberResult(
+                    fact_id=current["fact_id"],
+                    change_kind="unchanged",
+                    version=current["version"],
+                    previous_fact_id=None,
+                )
+            else:
+                # Modified: retire the old row, then insert the new version.
+                # Order matters - the partial unique index permits exactly one
+                # is_current=1 row per (target_id, entity_key), so the old row
+                # must be cleared before the new one lands.
+                conn.execute(
+                    "UPDATE facts SET is_current = 0 WHERE fact_id = ?",
+                    (current["fact_id"],),
+                )
+                result = self._insert_new(
+                    conn,
+                    target_id=target_id,
+                    entity_key=entity_key,
+                    content=content,
+                    attributes=attributes,
+                    digest=digest,
+                    source_url=source_url,
+                    confidence=confidence,
+                    importance=importance,
                     now=now,
                     vector_blob=vector_blob,
                     version=current["version"] + 1,
@@ -504,6 +588,33 @@ class MemoryServer:
                     first_seen_run_id=current["first_seen_run_id"],
                     first_seen_at=current["first_seen_at"],
                 )
+
+            if idempotency_key:
+                conn.execute(
+                    "INSERT INTO remember_receipts "
+                    "(idempotency_key, target_id, entity_key, result) VALUES (?, ?, ?, ?)",
+                    (idempotency_key, target_id, entity_key, result.model_dump_json()),
+                )
+            return result
+
+    @staticmethod
+    def _receipt(
+        conn: sqlite3.Connection, key: str, target_id: str, entity_key: str
+    ) -> Optional[RememberResult]:
+        row = conn.execute(
+            "SELECT target_id, entity_key, result FROM remember_receipts "
+            "WHERE idempotency_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["target_id"], row["entity_key"]) != (target_id, entity_key):
+            raise IdempotencyKeyReuseError(
+                f"idempotency_key {key!r} was already used for "
+                f"({row['target_id']!r}, {row['entity_key']!r}); refusing to reuse it "
+                f"for ({target_id!r}, {entity_key!r})"
+            )
+        return RememberResult.model_validate_json(row["result"])
 
     async def recall_facts(
         self,
@@ -718,6 +829,7 @@ class MemoryServer:
         confidence: float,
         now: str,
         vector_blob: Optional[bytes],
+        importance: Optional[float] = None,
         version: int,
         supersedes_id: Optional[int],
         change_kind: str,
@@ -734,9 +846,9 @@ class MemoryServer:
         cursor = conn.execute(
             "INSERT INTO facts ("
             "target_id, entity_key, content, attributes, content_hash, version, "
-            "is_current, supersedes_id, change_kind, confidence, source_url, "
+            "is_current, supersedes_id, change_kind, confidence, importance, source_url, "
             "first_seen_run_id, last_seen_run_id, first_seen_at, last_seen_at"
-            ") VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 target_id,
                 entity_key,
@@ -747,6 +859,7 @@ class MemoryServer:
                 supersedes_id,
                 change_kind,
                 confidence,
+                importance,
                 source_url,
                 first_seen_run_id or self.run_id,
                 self.run_id,
@@ -767,7 +880,7 @@ class MemoryServer:
 
         return RememberResult(
             fact_id=fact_id,
-            change_kind=change_kind if change_kind != "added" else "added",
+            change_kind=change_kind,
             version=version,
             previous_fact_id=supersedes_id,
         )
@@ -800,6 +913,8 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
         attributes: Optional[dict] = None,
         source_url: Optional[str] = None,
         confidence: float = 1.0,
+        importance: Optional[float] = None,
+        idempotency_key: Optional[str] = None,
     ) -> RememberResult:
         return await backend.remember_fact(
             target_id=target_id,
@@ -808,6 +923,8 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
             attributes=attributes,
             source_url=source_url,
             confidence=confidence,
+            importance=importance,
+            idempotency_key=idempotency_key,
         )
 
     @mcp.tool(

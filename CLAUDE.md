@@ -152,6 +152,9 @@ argus/
   calls that time out. Throughput has been seen dropping 5x mid-session.
 - The state transition and its checkpoint insert go in ONE transaction.
 - Every write goes through `db.atomic()` (BEGIN IMMEDIATE). No second helper.
+  One named exception: `ollama_client.log_call` is a single autocommit
+  INSERT, outside the step transaction on purpose, so the record of a call
+  survives a rolled-back step (audit 4, "checked and fine").
 - Async by default for anything I/O-bound. `httpx.AsyncClient`, never
   blocking `requests` inside an `async def`.
 - Model tags come from config, never hardcoded in source.

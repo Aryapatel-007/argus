@@ -255,9 +255,12 @@ def call_ollama(
             continue
         break
 
-    if ctx is not None:
+    if ctx is not None and role == "planner":
         # Covers timeouts too, not just parse failures: without an increment the
         # loop would re-enter PLAN forever on an unreachable server.
+        # Planner only (audit M1): parse_retries guards PLAN, and a critic
+        # timeout spending the planner's budget would fail a run on its first
+        # bad plan. The critic's own failures are bounded by MAX_ATTEMPTS.
         ctx.parse_retries += 1
     return None
 
