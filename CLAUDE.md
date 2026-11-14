@@ -69,15 +69,23 @@ on thinking. Measured (`notes/sprint1_thinking_probe.json`), one-sentence prompt
 
 ## Architecture
 
-- **Scheduler** — APScheduler, in-process, daily or weekly triggers.
-- **Orchestrator** — being replaced by a typed, dynamically expanding task
-  graph (ARGUS_BUILD.md Phase E): validator, router, two-lane scheduler,
-  graph-level checkpoints. The Sprint 1 linear loop
-  (`src/argus/orchestrator/loop.py`) stays until its behaviour is ported.
-  Hand-built. ReAct + Reflexion ideas, no agent framework.
-- **Tool servers** — custom MCP servers built with the official Python SDK:
-  - Memory server: `remember_fact`, `recall_facts`, `list_changes_since`
-  - Browser server: raw Playwright (D-002), page text out, no selectors
+- **Scheduler** — APScheduler in-process (`argus scheduler` / `argus up`):
+  per-target cron, catch-up, recovery of hard-killed runs, weekly reflect.
+- **Graph engine** (`src/argus/graph/`) — typed, dynamically expanding task
+  graph: validator (gate on every path, DAG, limits), store (every status
+  change + its node_events checkpoint in one tx), readiness, router (measured
+  priors + Thompson sampling, swap-aware), strategies, two-lane engine,
+  procedural memory. Spec: `notes/specs/graph-engine.md`. The Sprint 1 loop
+  (`orchestrator/`) is kept as a reference (D-024). No agent framework.
+- **Tool servers** — custom MCP servers built with the official Python SDK,
+  spawned per run over stdio (`graph/mcp_clients.py`):
+  - Memory server: `remember_fact`, `recall_facts`, `list_changes_since`,
+    `list_current_facts`
+  - Browser server: raw Playwright (D-002), page text + links out, no
+    selectors, internal origins blocked, degrades instead of raising
+- **Product** — `app.py` (sessions, watch, approvals), `observe.py` (traces,
+  routing explanations), `dashboard/` (127.0.0.1), `eval/` (24 scenarios,
+  judge, harness), `cli.py` (`argus ...`).
 - **Models via Ollama:** a measured pool, not fixed tiers. Which models are
   allowed lives in config; what they are good at lives in the database
   (`model_profiles`, `arm_stats`). Embeddings: `nomic-embed-text`, 768 dims.
@@ -121,10 +129,13 @@ argus/
   notes/           measurements, audit, decisions-log.md
   scripts/         one-off runners, smoke tests, probes, crash tests
   src/argus/
-    orchestrator/  Sprint 1 linear loop (until ported)
+    graph/         engine, router, strategies, handlers, prompts, MCP clients
     servers/       MCP servers (memory, browser)
-    storage/       schema, migrations, sqlite-vec setup
-  tests/
+    storage/       schema, migrations 001-007, leases, sqlite-vec setup
+    eval/          scenarios, harness, judge, fixture site
+    dashboard/     FastAPI + Jinja2, local only
+    orchestrator/  Sprint 1 linear loop (reference)
+  tests/           pytest; real-kill crash tests; hypothesis properties
 ```
 
 ---
