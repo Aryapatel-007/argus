@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -109,6 +110,21 @@ class RecalledFact(BaseModel):
     score: float = Field(description="Blended rank score, higher is better.")
     relevance: float = Field(description="Semantic closeness to the query, 0-1.")
     recency: float = Field(description="Freshness of last_seen_at, 0-1.")
+    last_seen_at: str
+    source_url: Optional[str] = None
+
+
+class CurrentFact(BaseModel):
+    """One current fact, as stored. No scores: this is a snapshot, not a search."""
+
+    fact_id: int
+    target_id: str
+    entity_key: str
+    content: str
+    attributes: Optional[dict] = None
+    confidence: Optional[float] = None
+    importance: Optional[float] = None
+    version: int
     last_seen_at: str
     source_url: Optional[str] = None
 
@@ -723,6 +739,35 @@ class MemoryServer:
         scored.sort(key=lambda f: (-f.score, f.fact_id))
         return scored[:limit]
 
+    async def list_current_facts(self, target_id: str, limit: int = 1000) -> list["CurrentFact"]:
+        """Every CURRENT fact of one target. No embedding, no ranking.
+
+        The graph's `recall` node uses this to diff a page against memory:
+        diffing needs the complete current snapshot for the target, not the
+        top-k nearest neighbours of some query, so semantic recall is the
+        wrong tool for it (and the retrieval-quality risk in Sprint 2 does
+        not apply here).
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        with db.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT fact_id, target_id, entity_key, content, attributes, confidence, importance, "
+                "version, last_seen_at, source_url FROM facts "
+                "WHERE is_current = 1 AND target_id = ? ORDER BY entity_key LIMIT ?",
+                (target_id, limit),
+            ).fetchall()
+        return [
+            CurrentFact(
+                fact_id=r["fact_id"], target_id=r["target_id"], entity_key=r["entity_key"],
+                content=r["content"],
+                attributes=json.loads(r["attributes"]) if r["attributes"] else None,
+                confidence=r["confidence"], importance=r["importance"], version=r["version"],
+                last_seen_at=r["last_seen_at"], source_url=r["source_url"],
+            )
+            for r in rows
+        ]
+
     async def list_changes_since(
         self,
         since: str,
@@ -950,6 +995,17 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
         )
 
     @mcp.tool(
+        name="list_current_facts",
+        description=(
+            "List every current fact for one target, without ranking or "
+            "embeddings. Use this to compare a fresh observation against "
+            "everything already known about the target."
+        ),
+    )
+    async def list_current_facts(target_id: str, limit: int = 1000) -> list[CurrentFact]:
+        return await backend.list_current_facts(target_id=target_id, limit=limit)
+
+    @mcp.tool(
         name="list_changes_since",
         description=(
             "List facts that changed after a given UTC timestamp (ISO 8601), "
@@ -981,6 +1037,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
+    if os.environ.get("ARGUS_FAKE_EMBED") == "1":
+        # Tests and offline crash runs only: deterministic vectors, no Ollama.
+        # It can only make embeddings fake, never send anything anywhere.
+        from argus.graph.fakes import install_fake_embeddings
+
+        install_fake_embeddings()
+        log("ARGUS_FAKE_EMBED=1: using deterministic fake embeddings")
     # Order matters: schema first, then the run. Checking the run against a
     # database with no `runs` table would raise OperationalError instead of
     # the clear migration message assert_migrated exists to give.

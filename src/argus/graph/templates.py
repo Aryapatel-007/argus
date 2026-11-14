@@ -51,6 +51,9 @@ def build_check_page(graph_id: str, target_id: str, params: Dict[str, Any], inst
     fetch = _n("fetch_page", instance, params={"url": params["url"]})
     extract = _n("extract", instance, params={"fields": fields, "target_id": target_id},
                  difficulty=float(params.get("difficulty", 0.5)))
+    # The extract's trigger (fields missing -> replan) must name the fetch
+    # node holding the page, so a follow_link template can search its links.
+    extract.params["_fetch_node"] = fetch.node_id
     critique = _n("critique", instance, params={"fields": fields})
     recall = _n("recall", instance, params={"target_id": target_id})
     resolve = _n("resolve_entity", instance, params={"target_id": target_id, "fields": fields})
@@ -67,6 +70,7 @@ def build_check_page(graph_id: str, target_id: str, params: Dict[str, Any], inst
         EdgeSpec(recall.node_id, resolve.node_id, "memory"),
         EdgeSpec(resolve.node_id, diff.node_id, "resolved"),
         EdgeSpec(recall.node_id, diff.node_id, "memory"),
+        EdgeSpec(fetch.node_id, diff.node_id, "evidence"),
         EdgeSpec(diff.node_id, write.node_id, "changes"),
         EdgeSpec(write.node_id, remember.node_id, "durable"),
     ]

@@ -1,0 +1,69 @@
+# Router and scheduler knobs. Read by src/argus/graph/router.py and engine.py.
+# Never hardcoded in source (ARGUS_BUILD 6.6).
+
+weights:
+  quality: 1.0        # expected quality in [0, 1], scaled by (0.5 + difficulty)
+  latency: 0.25       # expected call seconds / latency_scale_s
+  swap: 0.35          # seconds to make the model resident / latency_scale_s
+  risk: 0.6           # 1 - json_valid_rate, plus a timeout penalty
+latency_scale_s: 10.0
+
+# Unmeasured models start here until the profiler has run.
+defaults:
+  quality: 0.5
+  json_valid_rate: 0.8
+  mean_latency_s: 8.0
+  cold_load_s: 6.0
+
+# Beta prior strength: how many pseudo-observations the profiler's quality
+# score is worth. Higher = learning moves the router more slowly.
+prior_strength: 6
+
+# Bounded exploration (learning mode): at most this fraction of a graph's
+# routing decisions may differ from the greedy (posterior-mean) choice, and
+# none once less than `explore_min_budget` of the time budget remains.
+explore_cap: 0.2
+explore_min_budget: 0.3
+
+# A not-yet-started decision may be switched to the resident model when the
+# utility it gives up is at most this much (avoids a swap). Logged.
+revise_max_loss: 0.15
+
+# Facts below this extraction confidence must be confirmed by a second model.
+low_confidence: 0.6
+
+# self_consistency: node types and the difficulty at which it kicks in.
+self_consistency:
+  types: [critique]
+  min_difficulty: 0.8
+  samples: 3
+  temperature: 0.4
+
+# cascade: node types that try the cheapest adequate model first.
+cascade:
+  types: [extract, summarize]
+  adequate_quality: 0.7
+
+# resolve_entity and diff thresholds (D-016, D-020).
+resolve:
+  embed_same: 0.85        # recall relevance at or above: same entity
+  embed_maybe: 0.60       # between maybe and same: ask a model
+  unchanged_overlap: 0.85 # stored fact still on the page -> unchanged
+
+health:
+  degrade_ratio: 0.35       # tok/s below 35% of profiled tok/s is "slow"
+  strikes: 2                # consecutive slow calls or timeouts to degrade
+  cooldown_s: 300           # then one trial call decides (half-open breaker)
+
+budget:
+  seconds: 1800
+  tokens: 60000
+  prune_fraction: 0.15      # prune optional work below 15% remaining
+
+limits:
+  max_nodes: 120
+  max_depth: 24
+  max_expansions: 8
+  max_attempts: 3
+
+io_slots: 4

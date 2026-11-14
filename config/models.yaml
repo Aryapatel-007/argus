@@ -1,0 +1,25 @@
+# Which local models Argus MAY use. Never what they are good at: that is
+# measured by scripts/profile_models.py into `model_profiles` and learned by
+# the router into `arm_stats`. No tiers, no "fast/smart" labels (ARGUS_BUILD 6.1).
+#
+# Tags must match `ollama list` (":latest" is added when a tag has none).
+
+allowed:
+  - qwen3.5:9b
+  - phi4-mini:latest
+  - llama3.1:latest
+  - gemma4:e4b
+
+models:
+  # The Sprint 1 single-model design. Phase G's baseline runs everything on
+  # it, and the legacy linear loop's roles (planner/critic/writer/judge) use
+  # it. A named configuration, not a capability tier.
+  baseline: qwen3.5:9b
+  # Fixed by the schema: facts_vec is FLOAT[768]. Changing it needs a new
+  # migration and a full re-embed.
+  embed: nomic-embed-text
+
+ollama:
+  host: "http://127.0.0.1:11434"
+  num_ctx: 4096
+  keep_alive: "30m"

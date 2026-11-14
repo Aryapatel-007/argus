@@ -260,9 +260,14 @@ _register(NodeType("critique", "llm", inputs=("subject", "evidence"), provides=(
                    # unreviewed fact; neither is acceptable to save time.
                    prunable=False))
 _register(NodeType("recall", "tool", provides=("memory",), prunable=False))
-_register(NodeType("resolve_entity", "pure", inputs=("facts", "memory"), provides=("resolved",),
+# resolve_entity is routed like an LLM node: most facts resolve by key with no
+# model call, but ambiguous ones need a model check (entity_match prompt), and
+# that call must go through the GPU lane with a stored routing decision.
+_register(NodeType("resolve_entity", "llm", inputs=("facts", "memory"), provides=("resolved",),
                    role="resolve_entity", prunable=False))
-_register(NodeType("diff", "pure", inputs=("resolved", "memory"), provides=("changes",),
+# diff reads the page too: a stored fact whose words are still on the page is
+# unchanged, however the extractor phrased it this time (D-016).
+_register(NodeType("diff", "pure", inputs=("resolved", "memory", "evidence"), provides=("changes",),
                    prunable=False))
 _register(NodeType("write_fact", "llm", inputs=("changes",),
                    provides=("durable",), output_model=WriteFactOutput,

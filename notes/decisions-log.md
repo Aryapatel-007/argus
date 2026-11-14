@@ -180,3 +180,130 @@ overlap and returns the best same-domain URL.
 **Rejected:** a public search engine endpoint.
 **Why:** constraint 3. A search query is target data sent to a third party;
 following a link on the target's own site is not.
+
+## D-016 — Diff is grounding-based; write_fact never rewrites content
+
+**Chose:** a stored fact whose words are still on the page (verbatim after
+whitespace/case folding, or 85% word overlap with every number present) is
+`unchanged`, whatever wording the extractor used this time. `write_fact`
+only scores importance; the stored content is always the page's own words.
+**Rejected:** comparing the new extraction's text hash with the stored hash;
+letting the writer model rephrase facts before storing.
+**Why:** both make every weekly run report phantom "modified" facts, because
+model wording drifts run to run even at temperature 0 across models. The page
+is the ground truth that does not drift.
+
+## D-017 — Thompson sampling over UCB
+
+**Chose:** Beta posterior per (node type, model), seeded from the profiler's
+quality with `prior_strength` pseudo-observations; Thompson sampling with a
+greedy (posterior-mean) fallback when the exploration cap or low budget
+forbids exploring. Per-node seeded RNG makes a decision reproducible.
+**Rejected:** UCB1.
+**Why:** a weekly system sees tens of pulls per arm per month; UCB's bonus is
+tuned for many pulls and over-explores at this volume, while Thompson uses
+the profiler prior directly and has a natural greedy fallback for the
+bounded-exploration rule (ARGUS_BUILD 6.6).
+
+## D-018 — Swap cost model
+
+**Chose:** 0 if the model is resident; half its cold load if it can load
+beside everything resident (co-residency matrix, both load orders must keep
+both); otherwise its full cold load. Scaled by `latency_scale_s` and weighted
+in config.
+**Rejected:** the directive's literal "zero if co-resident".
+**Why:** a co-resident model still has to load (a real 3-8s), it just evicts
+nothing. Calling that free would make the router pick it too eagerly.
+
+## D-019 — The approval gate is enforced three times
+
+**Chose:** (1) the validator rejects any graph where an execute_action is
+reachable without crossing an approval_gate; (2) readiness never readies an
+execute_action until every gate ancestor is `done`, and fails closed when it
+finds none; (3) the executor claims the approvals row (approved -> executed,
+claimed_by this node, in one transaction) and acts only after that claim;
+the effect itself (outbox file named by the idempotency key) is idempotent
+(D-023 has the claim protocol).
+**Rejected:** any single one of these.
+**Why:** hard constraint 4 must survive a bug in any one layer; each layer
+has its own test and mutant.
+
+## D-020 — resolve_entity is routed as an LLM node
+
+**Chose:** normalized key match first, then memory-server semantic recall
+(relevance >= 0.85 = same entity), then a model check (`entity_match`) only
+for 0.60-0.85. The node runs in the GPU lane with a stored routing decision
+because it may call a model; the path that decided each match is stored in
+its output.
+**Rejected:** a pure node that calls a model ad hoc (no stored decision, so
+non-deterministic on resume); embedding in the orchestrator (Sprint 2 put
+embeddings in the memory server).
+**Why:** ARGUS_BUILD 6.9 and crash-resume determinism.
+
+## D-021 — No tier labels in config; legacy roles map to a named baseline
+
+**Chose:** `config/models.yaml` is an allowlist plus two named models:
+`baseline` (the Sprint 1 single-model design, used by the legacy loop and by
+Phase G's baseline) and `embed`. The `fast` tier and the `router: fast` role
+are gone. `targets.yaml` holds only targets.
+**Rejected:** keeping `chat`/`fast` keys.
+**Why:** ARGUS_BUILD 6.1 forbids capability tiers in config or code; what a
+model is good at is measured (`model_profiles`) and learned (`arm_stats`).
+
+## D-022 — Critic independence: exclude the author, fall back only on an exhausted pool
+
+**Chose:** a critique excludes the model that AUTHORED the judged output
+(`_produced_by` on the subject node's output), not every model its decision
+named. Only when every model in the pool is that author (a one-model pool,
+or baseline mode) does the critic share it, and the decision's reason says so
+("NO INDEPENDENT MODEL IN POOL"); the critic reward is never applied when
+author == critic.
+**Rejected:** failing or skipping the critique when no independent model
+exists (a one-model install would never store a fact); excluding all decision
+models (a cascade names two, which emptied a two-model pool and pushed the
+critic onto the author; review High 2).
+**Why:** independence is what makes a critic verdict evidence. Where it is
+physically impossible the system still works, says so, and learns nothing
+from it.
+
+## D-023 — The executor claims the approval before acting
+
+**Chose:** `execute_action` first flips the approvals row approved ->
+executed with `{"claimed_by": node}` in one transaction, then performs the
+idempotent effect (outbox file named by the key), then records the final
+result with the node's done. A resumed node finishes its own claim; any
+other state is refused.
+**Rejected:** act-then-flip (a human could reject between the read and the
+flip, or a crash could leave a sent message under a non-executed row;
+review M10); adding an `executing` status (needs a table rebuild of
+approvals for no extra safety).
+**Why:** once claimed, nobody can change the decision under the action, and
+every crash point (after claim, after effect) resumes to exactly one effect.
+Proven by real-kill crash tests for both windows. If the action itself raises
+after the claim, the row becomes `failed` (nothing was sent: the executor
+writes atomically), so the table never says an action happened when it did
+not.
+
+Migration 002's comment says approved and executed are "deliberately
+SEPARATE" because approved-but-not-executed is the crash window. That window
+still exists and is still recoverable; it is now marked by the claim
+(`status = executed`, `result.state = "claimed"`) instead of by
+`status = approved`. `result.state` moves claimed -> done or -> failed. A
+reader of the table must treat `executed` + `state: claimed` as "in flight".
+
+## D-024 — Step 12: the graph engine carries the legacy loop's guarantees; the loop stays as a reference
+
+**Chose:** keep `orchestrator/loop.py` and its tests unchanged and running
+(they guard the audited C1/H2 fixes), and prove every legacy crash-resume
+guarantee on the graph engine with real-process kills: planner in flight
+(`plan:0`), critic in flight (`critique:0`), plus the windows the loop never
+had (extract, cross_model between samples, summarize, write_fact, remember
+after commit, execute after claim and after effect). New runs go through the
+graph engine (`python -m argus.graph.runner`).
+**Rejected:** re-implementing the linear loop as a "legacy" graph template
+just to make `scripts/crash_test.py` (which drives `orchestrator.runner`)
+pass against the new engine.
+**Why:** the guarantee is what must survive, not the state enum. A template
+mimicking PLAN/ACT/OBSERVE would add a second orchestration path to keep
+correct. `scripts/crash_test.py` still runs against the loop it was written
+for.
