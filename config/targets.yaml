@@ -1,11 +1,8 @@
-models:
-  chat: qwen3.5:9b
-  fast: phi4-mini
-  embed: nomic-embed-text
-
-ollama:
-  host: "http://127.0.0.1:11434"
-  num_ctx: 4096
+# What Argus watches. Models and Ollama settings live in config/models.yaml.
+#
+# notify: true adds the propose -> approval_gate -> execute chain to a run
+# whose digest is not empty. The only action kind today is `outbox_message`
+# (a file in data/outbox/), which a human approves first.
 
 targets:
   - id: monash_ai_masters
@@ -14,6 +11,7 @@ targets:
     type: program
     frequency: weekly
     extract: [intake_dates, duration, fees, entry_requirements]
+    notify: true
 
   - id: rmit_ai_masters
     name: "RMIT Master of Artificial Intelligence"
@@ -21,6 +19,7 @@ targets:
     type: program
     frequency: weekly
     extract: [intake_dates, duration, fees, entry_requirements]
+    notify: true
 
   - id: homeaffairs_skilled_visa
     name: "Australian Home Affairs — skilled migration news"
@@ -28,3 +27,4 @@ targets:
     type: policy
     frequency: weekly
     extract: [announcement_title, announcement_date, summary]
+    notify: false

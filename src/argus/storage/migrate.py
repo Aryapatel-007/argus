@@ -136,8 +136,43 @@ def apply_migrations(
         return _apply_locked(db_path, migrations_dir)
 
 
+def backup_if_pending(db_path: db.PathLike, migrations_dir: Path = MIGRATIONS_DIR) -> Path | None:
+    """Copy an EXISTING database before any pending migration touches it.
+
+    Migrations 002 and 007 rebuild llm_calls (copy, drop, rename) inside a
+    transaction. That is safe, but data/argus.db holds real collected data,
+    so a byte-for-byte backup is taken first with SQLite's online backup API
+    (consistent even in WAL mode). Fresh or fully migrated files: no copy.
+    """
+    path = Path(db_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    files = sorted(p.name for p in migrations_dir.glob("*.sql"))
+    src = sqlite3.connect(path)
+    try:
+        try:
+            done = {r[0] for r in src.execute("SELECT filename FROM schema_migrations")}
+        except sqlite3.OperationalError:
+            done = set()
+        if not [f for f in files if f not in done] or not done:
+            return None
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup_dir = path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = backup_dir / f"{path.stem}-pre-migrate-{stamp}{path.suffix}"
+        dest = sqlite3.connect(dest_path)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+        return dest_path
+    finally:
+        src.close()
+
+
 def _apply_locked(db_path: db.PathLike, migrations_dir: Path) -> List[str]:
     applied: List[str] = []
+    backup_if_pending(db_path, migrations_dir)
 
     with db.connect(db_path) as conn:
         conn.execute(_BOOTSTRAP)

@@ -137,6 +137,11 @@ def log_call(
     timed_out: bool,
     error: Optional[str],
     raw_response: Optional[str],
+    graph_id: Optional[str] = None,
+    node_id: Optional[str] = None,
+    strategy: Optional[str] = None,
+    sample_index: Optional[int] = None,
+    decision_id: Optional[str] = None,
 ) -> None:
     """Insert one llm_calls row. Called for EVERY attempt, success or not.
 
@@ -170,8 +175,9 @@ def log_call(
         "INSERT INTO llm_calls ("
         "call_id, run_id, task_id, step_index, role, model_tag, think_mode, "
         "prompt_file, prompt_eval_count, eval_count, eval_duration_ns, "
-        "total_duration_ns, tok_s, ok, timed_out, error, raw_response"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "total_duration_ns, tok_s, ok, timed_out, error, raw_response, "
+        "graph_id, node_id, strategy, sample_index, decision_id"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             str(uuid.uuid4()),
             run_id,
@@ -190,5 +196,10 @@ def log_call(
             1 if timed_out else 0,
             error,
             raw_response,
+            graph_id,
+            node_id,
+            strategy,
+            sample_index,
+            decision_id,
         ),
     )

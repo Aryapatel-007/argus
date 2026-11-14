@@ -113,6 +113,21 @@ class RecalledFact(BaseModel):
     source_url: Optional[str] = None
 
 
+class CurrentFact(BaseModel):
+    """One current fact, as stored. No scores: this is a snapshot, not a search."""
+
+    fact_id: int
+    target_id: str
+    entity_key: str
+    content: str
+    attributes: Optional[dict] = None
+    confidence: Optional[float] = None
+    importance: Optional[float] = None
+    version: int
+    last_seen_at: str
+    source_url: Optional[str] = None
+
+
 class EmptyContentError(ValueError):
     """Raised for blank content. Surfaces to the model as a readable message.
 
@@ -723,6 +738,35 @@ class MemoryServer:
         scored.sort(key=lambda f: (-f.score, f.fact_id))
         return scored[:limit]
 
+    async def list_current_facts(self, target_id: str, limit: int = 200) -> list["CurrentFact"]:
+        """Every CURRENT fact of one target. No embedding, no ranking.
+
+        The graph's `recall` node uses this to diff a page against memory:
+        diffing needs the complete current snapshot for the target, not the
+        top-k nearest neighbours of some query, so semantic recall is the
+        wrong tool for it (and the retrieval-quality risk in Sprint 2 does
+        not apply here).
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit}")
+        with db.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT fact_id, target_id, entity_key, content, attributes, confidence, importance, "
+                "version, last_seen_at, source_url FROM facts "
+                "WHERE is_current = 1 AND target_id = ? ORDER BY entity_key LIMIT ?",
+                (target_id, limit),
+            ).fetchall()
+        return [
+            CurrentFact(
+                fact_id=r["fact_id"], target_id=r["target_id"], entity_key=r["entity_key"],
+                content=r["content"],
+                attributes=json.loads(r["attributes"]) if r["attributes"] else None,
+                confidence=r["confidence"], importance=r["importance"], version=r["version"],
+                last_seen_at=r["last_seen_at"], source_url=r["source_url"],
+            )
+            for r in rows
+        ]
+
     async def list_changes_since(
         self,
         since: str,
@@ -948,6 +992,17 @@ def build_server(db_path: Path, run_id: str) -> MCPServer:
             limit=limit,
             min_confidence=min_confidence,
         )
+
+    @mcp.tool(
+        name="list_current_facts",
+        description=(
+            "List every current fact for one target, without ranking or "
+            "embeddings. Use this to compare a fresh observation against "
+            "everything already known about the target."
+        ),
+    )
+    async def list_current_facts(target_id: str, limit: int = 200) -> list[CurrentFact]:
+        return await backend.list_current_facts(target_id=target_id, limit=limit)
 
     @mcp.tool(
         name="list_changes_since",

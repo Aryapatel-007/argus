@@ -55,6 +55,56 @@ then ARGUS_BUILD.md.
   one vacuous test: `atomic()` could not tell BEGIN from BEGIN IMMEDIATE).
 - Tests: 230 at the Phase D commit.
 
+## PAUSED (2026-11-14, at Arya's request) — resume here
+
+Work in progress is committed on branch `wip/phase-e` (NOT main). main is at
+the Phase E step 2 commit (270 tests passing). To resume:
+`git checkout wip/phase-e`, then:
+
+1. Fix the one failing test:
+   `tests/test_graph_engine.py::test_critique_rejection_retries_extract_with_the_reflection`
+   expects extract attempts [1, 2] but gets [1, 2, 3]. Likely cause: the
+   fake's `mislabel_first` counter is per model, and the router routes
+   extract attempt 2 to the OTHER model (or the low-confidence second
+   opinion consumes it), so the mislabel fires twice. Check which models the
+   three extract attempts used (routing_decisions) before changing anything.
+   Do not weaken the test; fix the fake or the expectation with a reason.
+2. Run `python -m pytest -q` (expect ~283+). The other 12 engine tests pass.
+3. Read `notes/model-profiles.md` (written by the profiler when it finished)
+   and check `data/profile-run.log` / `data/profile-run.err.log`. The
+   profiler was launched detached (`Start-Process`, pid 22780) on
+   data/argus.db; it was in its final co-residency phase at pause time.
+   data/argus.db was migrated to 007 by it; a pre-migration backup is in
+   `data/backups/`.
+4. Then: reviewer pass on the WIP diff (router, strategies, engine, handlers,
+   approval gate path), commit to main as Phase E steps 4-6/8 in pieces,
+   add mutants for the engine's gate path, and continue with step 7
+   (real-process crash test of the graph engine), 9-12.
+
+Uncommitted-to-main pieces on wip/phase-e: config/models.yaml +
+config/routing.yaml (no tier labels; targets.yaml now only targets);
+config.py rewrite; graph/llm.py (async backend, think=False, 120s
+wall-clock cap); graph/prompts/*.md (page text fenced in <untrusted>);
+graph/llm_nodes.py; graph/registry.py; eval/node_fixtures.py;
+scripts/profile_models.py; graph/router.py, bandit.py (Thompson), health.py
+(half-open breaker); graph/services.py (DirectMemory, StaticBrowser,
+ActionExecutor outbox); graph/strategies.py; graph/handlers.py;
+graph/engine.py (two lanes, swap-aware batching, plan fallback, budgets);
+graph/procedural.py; graph/fakes.py; memory server `list_current_facts`;
+store.py lease guard on every write + atomic plan completion; migrate.py
+backs up a partially migrated DB before migrating; tests/test_graph_engine.py.
+
+Decisions taken in this WIP and NOT yet logged in notes/decisions-log.md
+(log them on resume): D-016 diff is grounding-based (a stored fact whose
+words are still on the page is unchanged; write_fact never rewrites
+content, only scores importance); D-017 Thompson sampling over UCB (reason in
+graph/bandit.py docstring); D-018 swap cost = 0 resident, half cold load if
+co-resident with everything resident, else full cold load; D-019 approval
+gate is enforced three times (validator structure, readiness, executor
+re-reads approvals row); D-020 resolve_entity is routed as an LLM node
+(model check only for ambiguous matches); D-021 legacy roles map to a named
+`baseline` model, `fast` tier removed.
+
 ## Phase E progress
 
 Spec: `notes/specs/graph-engine.md`. Package `src/argus/graph/`.

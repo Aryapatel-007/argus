@@ -219,10 +219,13 @@ def plan_retries(nodes: Dict[str, Any], edges: List[EdgeSpec], limits: Limits
 def graph_outcome(nodes: Dict[str, Any]) -> Optional[str]:
     """None while work remains; else 'waiting_approval', 'failed' or 'done'."""
     statuses = {n.status for n in nodes.values()}
-    if statuses & {"pending", "ready", "running"}:
+    if statuses & {"ready", "running"}:
         return None
     if "blocked" in statuses:
+        # Pending nodes behind a blocked gate wait for a human, not for work.
         return "waiting_approval"
+    if "pending" in statuses:
+        return None
     # A chain that ended with no done member, on a node that mattered.
     chains: Dict[str, List[Any]] = defaultdict(list)
     for n in nodes.values():

@@ -7,21 +7,20 @@ Requires `ollama serve` running locally.
 import sys
 from pathlib import Path
 
-import yaml
 from ollama import Client
 
 NS_PER_S = 1_000_000_000
 
-CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "targets.yaml"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 CHAT_PROMPT = "In one sentence, what does a task scheduler do?"
 EMBED_TEXT = "Master of Artificial Intelligence intake dates"
 
 
 def main() -> None:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
+    from argus import config as argus_config
 
-    models = config["models"]
+    config = argus_config.load_config()
+    models = {"chat": argus_config.model_for_role("planner"), "embed": config["models"]["embed"]}
     ollama_cfg = config["ollama"]
     client = Client(host=ollama_cfg["host"], timeout=120)  # CLAUDE.md: hard 120s
 

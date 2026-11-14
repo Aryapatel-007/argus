@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from argus.graph import nodes as node_types
 from argus.graph import validator
 from argus.graph.model import EdgeSpec, GraphSpec, Limits, NodeSpec
-from argus.storage import db
+from argus.storage import db, lease
 
 #: Legal status changes. Anything else is a bug and raises.
 TRANSITIONS = {
@@ -116,8 +117,21 @@ def _default_prunable(node: NodeSpec) -> bool:
 
 
 class GraphStore:
-    def __init__(self, conn: sqlite3.Connection):
+    def __init__(self, conn: sqlite3.Connection, *, run_id: Optional[str] = None,
+                 lease_owner: Optional[str] = None):
+        """With `lease_owner`, EVERY write transaction first proves this
+        process still owns the run (heartbeat UPDATE + rowcount check, audit
+        H2). A process that lost the run cannot write one row of graph state."""
         self.conn = conn
+        self.run_id = run_id
+        self.lease_owner = lease_owner
+
+    @contextmanager
+    def _tx(self):
+        with db.atomic(self.conn):
+            if self.lease_owner is not None:
+                lease.assert_held(self.conn, self.run_id, self.lease_owner)
+            yield
 
     # ------------------------------------------------------------------ reads
 
@@ -200,7 +214,7 @@ class GraphStore:
         graph_id: Optional[str] = None,
     ) -> str:
         graph_id = graph_id or f"graph-{uuid.uuid4().hex[:12]}"
-        with db.atomic(self.conn):
+        with self._tx():
             self.conn.execute(
                 "INSERT INTO graphs (graph_id, run_id, target_id, kind, status, limits, config, "
                 "budget_s, budget_tokens) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?)",
@@ -219,6 +233,7 @@ class GraphStore:
         expansion_id: Optional[str] = None,
         counts_toward_limit: bool = True,
         allow_existing_dst: bool = False,
+        complete_node: Optional[Tuple[str, Dict[str, Any]]] = None,
     ) -> Tuple[bool, List[validator.Violation]]:
         """Validate, then store the expansion and its nodes in ONE transaction.
 
@@ -253,13 +268,22 @@ class GraphStore:
             ],
             "edges": [[e.src, e.dst, e.channel] for e in expansion.edges],
         }, sort_keys=True, default=str)
-        with db.atomic(self.conn):
+        with self._tx():
             self.conn.execute(
                 "INSERT INTO graph_expansions (expansion_id, graph_id, requested_by, kind, spec, "
                 "accepted, violations) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (expansion_id, graph_id, requested_by, kind, spec_json, int(accepted),
                  json.dumps([v.__dict__ for v in violations])),
             )
+            if complete_node is not None:
+                # The planner node's output and the nodes it created land
+                # together: a crash can never leave a done planner without
+                # its expansion, or an expansion whose planner re-runs.
+                node_id, output = complete_node
+                self._set_status(node_id, "done", expect=("running",),
+                                 output={**output, "expansion_id": expansion_id,
+                                         "expansion_accepted": accepted,
+                                         "violations": [str(v) for v in violations]})
             if not accepted:
                 return False, violations
             for n in expansion.nodes.values():
@@ -354,7 +378,7 @@ class GraphStore:
         """One node status change + its checkpoint event (+ extra ops), atomically."""
         if to == "done" and output is None:
             raise ValueError("a node can only become done with its output")
-        with db.atomic(self.conn):
+        with self._tx():
             self._set_status(node_id, to, expect=expect, output=output, error=error,
                              skip_reason=skip_reason, detail=detail)
             for sql, params in extra_ops:
@@ -364,7 +388,7 @@ class GraphStore:
         """Several (node_id, to, kwargs) changes in one transaction (readiness sweeps)."""
         if not changes:
             return
-        with db.atomic(self.conn):
+        with self._tx():
             for node_id, to, kwargs in changes:
                 self._set_status(node_id, to, **kwargs)
 
@@ -388,7 +412,7 @@ class GraphStore:
         """Store a live routing decision. With revise=True, supersede the
         current live one (only if it is not frozen) and link to it."""
         decision_id = f"dec-{uuid.uuid4().hex[:12]}"
-        with db.atomic(self.conn):
+        with self._tx():
             live = self.conn.execute(
                 "SELECT decision_id, frozen FROM routing_decisions WHERE node_id = ? AND superseded = 0",
                 (node_id,),
@@ -416,7 +440,7 @@ class GraphStore:
 
     def start_node(self, node_id: str) -> None:
         """ready -> running, freezing the live routing decision in the same tx."""
-        with db.atomic(self.conn):
+        with self._tx():
             self._set_status(node_id, "running", expect=("ready",))
             self.conn.execute(
                 "UPDATE routing_decisions SET frozen = 1 WHERE node_id = ? AND superseded = 0",
@@ -425,7 +449,7 @@ class GraphStore:
 
     def store_sample(self, node_id: str, index: int, model_tag: str,
                      output: Optional[Dict[str, Any]], ok: bool, error: Optional[str]) -> None:
-        with db.atomic(self.conn):
+        with self._tx():
             self.conn.execute(
                 "INSERT INTO node_samples (node_id, sample_index, model_tag, output, ok, error) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (node_id, sample_index) DO NOTHING",
@@ -437,7 +461,7 @@ class GraphStore:
     # ---------------------------------------------------------------- graph
 
     def set_graph_status(self, graph_id: str, status: str) -> None:
-        with db.atomic(self.conn):
+        with self._tx():
             finished = _now() if status in ("done", "failed") else None
             self.conn.execute(
                 "UPDATE graphs SET status = ?, finished_at = COALESCE(?, finished_at) "
@@ -446,7 +470,7 @@ class GraphStore:
             )
 
     def add_usage(self, graph_id: str, *, tokens: int = 0, seconds: float = 0.0) -> None:
-        with db.atomic(self.conn):
+        with self._tx():
             self.conn.execute(
                 "UPDATE graphs SET tokens_used = tokens_used + ?, seconds_used = seconds_used + ? "
                 "WHERE graph_id = ?",
@@ -466,7 +490,7 @@ class GraphStore:
             )
         ]
         if ids:
-            with db.atomic(self.conn):
+            with self._tx():
                 for node_id in ids:
                     self._set_status(node_id, "ready", expect=("running",),
                                      detail={"reason": "resume"})
