@@ -66,6 +66,8 @@ def test_hard_kill_mid_run_then_restart_resumes_it(tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=30)
+    if sys.platform == "win32":
+        assert tree, "positive control: the scheduler's memory MCP server must be in its process tree"
     deadline = time.time() + 20
     while time.time() < deadline and any(pid_alive(p) for p in tree):
         time.sleep(0.3)

@@ -199,8 +199,7 @@ async def _diff(ex: Any) -> NodeResult:
                 "source_url": source_url}
         if stored is None:
             items.append({**base, "content": r["content"], "change_kind": "added"})
-        elif (llm_nodes.norm_space(stored["content"]) == llm_nodes.norm_space(r["content"])
-              or llm_nodes.supported(stored["content"], text, min_overlap=_resolve_cfg(ex)["unchanged_overlap"])):
+        elif llm_nodes.still_stated(stored["content"], text, extracted=r["content"]):
             items.append({**base, "content": stored["content"], "change_kind": "unchanged",
                           "attributes": stored.get("attributes"), "importance": stored.get("importance")})
         else:
@@ -210,7 +209,7 @@ async def _diff(ex: Any) -> NodeResult:
         if key in seen or key not in memory_items:
             continue
         stored = memory_items[key]
-        if llm_nodes.supported(stored["content"], text, min_overlap=_resolve_cfg(ex)["unchanged_overlap"]):
+        if llm_nodes.still_stated(stored["content"], text):
             items.append({"entity_key": key, "content": stored["content"], "change_kind": "unchanged",
                           "attributes": stored.get("attributes"), "importance": stored.get("importance"),
                           "resolution": "still_on_page"})
@@ -279,6 +278,10 @@ async def _fetch(ex: Any) -> NodeResult:
     if not same_site(url, ex.target.get("url", "")):
         return NodeResult("failed", error=f"refusing off-site url {url!r} for target {ex.target['id']}")
     page = await ex.services.browser.open_page(url)
+    final = page.get("final_url") or url
+    if not same_site(final, ex.target.get("url", "")):
+        # A redirect must not take facts off-site (Phase F review M2).
+        return NodeResult("failed", error=f"page redirected off-site to {final!r}; refused")
     if not page.get("ok") or not (page.get("text") or "").strip():
         return NodeResult("failed", error=f"fetch failed: status={page.get('status')} {page.get('error')}")
     return NodeResult("done", output={"page": page, "evidence": page},

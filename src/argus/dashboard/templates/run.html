@@ -7,7 +7,7 @@
 {% for g in trace.graphs %}
 <h3>Graph <span class="mono">{{ g.graph_id }}</span> &middot; <span class="s-{{ g.status }}">{{ g.status }}</span>
 &middot; {{ g.swaps }} model swap{{ "s" if g.swaps != 1 }} &middot; {{ g.tokens_used }} tokens &middot; {{ "%.1f"|format(g.seconds_used) }}s</h3>
-<p class="muted">Model order: {{ g.model_sequence|join(" &rarr; ")|safe if g.model_sequence else "none" }}</p>
+<p class="muted">Model order: {{ g.model_sequence|join(" → ") if g.model_sequence else "none" }}</p>
 <div class="scroll"><table>
 <tr><th>Span</th><th>Status</th><th>Try</th><th>Model / strategy</th><th>Duration</th><th>Calls</th><th>Detail</th></tr>
 {% for s in g.spans %}

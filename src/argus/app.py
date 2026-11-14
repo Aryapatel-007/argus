@@ -23,7 +23,7 @@ from argus.graph.engine import Engine, RunOutcome
 from argus.graph.llm import OllamaBackend
 from argus.graph.mcp_clients import McpBrowser, RunMemory
 from argus.graph.services import ActionExecutor, Services, StaticBrowser
-from argus.storage import db
+from argus.storage import db, lease
 from argus.storage.migrate import apply_migrations
 
 
@@ -41,6 +41,7 @@ class Options:
     #: crash-test hooks (runner flags), never set in production
     backend: Any = None
     actions: Any = None
+    browser: Any = None             # any BrowserAPI (eval harness)
     hang_remember_after: Optional[int] = None
 
 
@@ -54,7 +55,10 @@ def _services(opts: Options):
     if opts.fake_embed:
         fakes.install_fake_embeddings()
         os.environ["ARGUS_FAKE_EMBED"] = "1"  # inherited by the memory server
-    browser = StaticBrowser(opts.pages) if opts.pages is not None else McpBrowser(opts.browser_args)
+    if opts.browser is not None:
+        browser = opts.browser
+    else:
+        browser = StaticBrowser(opts.pages) if opts.pages is not None else McpBrowser(opts.browser_args)
     memory = RunMemory(Path(opts.db_path), mode=opts.memory, hang_after=opts.hang_remember_after)
     outbox = Path(opts.outbox) if opts.outbox else Path(opts.db_path).parent / "outbox"
     actions = opts.actions or ActionExecutor(outbox)
@@ -76,13 +80,24 @@ class Session:
         return self
 
     async def __aexit__(self, *exc) -> None:
-        await self.memory.close()
-        if isinstance(self.services.browser, McpBrowser):
-            await self.services.browser.close()
+        try:
+            await self.memory.close()
+        finally:
+            if isinstance(self.services.browser, McpBrowser):
+                await self.services.browser.close()
 
     async def run_target(self, target: Dict[str, Any], run_id: Optional[str] = None) -> RunOutcome:
         run_id, graph_id = self.engine.start_run(target, run_id=run_id)
-        await self.memory.open(run_id)  # AFTER the runs row is committed
+        try:
+            await self.memory.open(run_id)  # AFTER the runs row is committed
+        except BaseException:
+            # start_run took the run's lease for this live process. If the
+            # memory server cannot start, nothing would ever release it and
+            # the run could never be resumed (Phase F review M1). Free it: the
+            # graph stays 'running' with no owner, which recovery picks up.
+            with db.connect(Path(self.opts.db_path)) as conn:
+                lease.release(conn, run_id, self.engine.owner)
+            raise
         try:
             return await self.engine.run_graph(graph_id)
         finally:
@@ -125,7 +140,12 @@ async def resume_decided(opts: Options) -> List[RunOutcome]:
     outcomes: List[RunOutcome] = []
     async with Session(opts) as s:
         for run_id in decided_waiting_runs(Path(opts.db_path)):
-            outcomes.extend(await s.resume(run_id))
+            try:
+                outcomes.extend(await s.resume(run_id))
+            except lease.LeaseLost:
+                outcomes.append(RunOutcome(run_id, "", "owned by a live process (left alone)"))
+            except Exception as exc:  # noqa: BLE001 - one run never blocks the others
+                outcomes.append(RunOutcome(run_id, "", f"error: {exc!r}"[:300]))
     return outcomes
 
 

@@ -26,17 +26,17 @@ from argus import app as argus_app
 from argus import observe
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
-LOCAL_HOSTS = {"127.0.0.1", "localhost", "testserver"}
+LOCAL_HOSTS = {"127.0.0.1", "localhost"}
 
 
-def create_app(db_path: Path, csrf_token: Optional[str] = None) -> FastAPI:
+def create_app(db_path: Path, csrf_token: Optional[str] = None, extra_hosts: tuple = ()) -> FastAPI:
     api = FastAPI(title="Argus", docs_url=None, redoc_url=None, openapi_url=None)
     token = csrf_token or secrets.token_urlsafe(32)
     api.state.csrf = token
 
     def check_host(request: Request) -> None:
         host = (request.headers.get("host") or "").split(":")[0]
-        if host not in LOCAL_HOSTS:
+        if host not in LOCAL_HOSTS | set(extra_hosts):
             raise HTTPException(403, "dashboard is local only")
 
     def page(request: Request, name: str, **ctx):
@@ -72,7 +72,7 @@ def create_app(db_path: Path, csrf_token: Optional[str] = None) -> FastAPI:
     def decide(request: Request, approval_id: int, decision: str = Form(...), csrf: str = Form(...),
                note: str = Form("")):
         check_host(request)
-        if not secrets.compare_digest(csrf, token):
+        if not secrets.compare_digest(csrf.encode("utf-8"), token.encode("utf-8")):
             raise HTTPException(403, "bad csrf token")
         if decision not in ("approve", "reject"):
             raise HTTPException(400, "decision must be approve or reject")

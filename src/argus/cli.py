@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from argus import app, config, observe
-from argus.storage import db
+from argus.storage import db, lease
 
 
 def _opts(args) -> app.Options:
@@ -99,7 +99,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         async def go():
             async with app.Session(_opts(args)) as session:
                 return await session.resume(args.run_id)
-        return _print_outcomes(asyncio.run(go()))
+        try:
+            return _print_outcomes(asyncio.run(go()))
+        except lease.LeaseLost as exc:
+            print(f"{exc} (the scheduler may be driving it; it will finish it)", file=sys.stderr)
+            return 3
     if args.command == "resume-decided":
         return _print_outcomes(asyncio.run(app.resume_decided(_opts(args))))
     if args.command == "approvals":
@@ -125,7 +129,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
         print(f"#{row['approval_id']} is now {row['status']}")
         if args.then_resume:
-            return _print_outcomes(asyncio.run(app.resume_decided(app.Options(db_path=db_path))))
+            run_id = row["created_run_id"]
+            async def go():
+                async with app.Session(app.Options(db_path=db_path)) as session:
+                    return await session.resume(run_id)
+            try:
+                return _print_outcomes(asyncio.run(go()))
+            except lease.LeaseLost:
+                print("the run is being driven by another process (the scheduler); it will finish it")
+                return 0
         print("run `argus resume-decided` (or the scheduler will) to continue the run")
         return 0
     if args.command == "runs":

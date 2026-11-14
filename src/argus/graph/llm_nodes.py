@@ -42,6 +42,25 @@ def norm_space(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "")).strip().lower()
 
 
+def canon(text: str) -> str:
+    """Whitespace/case folded, and thousands separators dropped inside
+    numbers: '45,000' and '45000' are the same value."""
+    return re.sub(r"(?<=\d),(?=\d{3}\b)", "", norm_space(text))
+
+
+def still_stated(stored: str, page_text: str, extracted: Optional[str] = None) -> bool:
+    """Is a stored fact still what the page says? (D-016, refined in Phase F.)
+
+    Verbatim presence (after canon) or an identical new extraction. Word
+    overlap alone is NOT enough: the eval harness found "Intakes: February
+    and July" passing an overlap test against "February, July and November"
+    (every old word still there, the meaning changed)."""
+    s = canon(stored)
+    if s and s.rstrip(".") in canon(page_text):
+        return True
+    return extracted is not None and canon(extracted).rstrip(".") == s.rstrip(".")
+
+
 def supported(claim: str, evidence: str, min_overlap: float = 0.6) -> bool:
     """Is `claim` stated by `evidence`? Verbatim (whitespace/case folded), or
     most of its words present and every number present."""
@@ -263,6 +282,18 @@ def _write_shape(parsed, inputs, params):
     return {"durable": {"facts": durable}}
 
 
+def _write_validate(output, inputs, params):
+    """Validate only what is KEPT. `_write_shape` stores the page's own words
+    and takes nothing but the importance score from the model (D-016), so
+    checking numbers in the model's restated content was rejecting answers
+    for text that is thrown away. Measured: qwen3.5:9b failed it 3 times in a
+    row in the first Phase G smoke run ("45000" copied from the previous
+    value). Now: every key must be one of the changed facts."""
+    wanted = {it["entity_key"] for it in _changed(inputs.get("changes"))}
+    return [f"fact {i}: entity_key {f.get('entity_key')!r} is not one of the changed facts {sorted(wanted)}"
+            for i, f in enumerate(output.get("facts", [])) if f.get("entity_key") not in wanted]
+
+
 def _write_agree(a, b):
     sa = {f["entity_key"]: f["importance"] for f in a.get("facts", [])}
     sb = {f["entity_key"]: f["importance"] for f in b.get("facts", [])}
@@ -360,8 +391,7 @@ NODES: Dict[str, LLMNode] = {
                         _critique_shape, lambda a, b: a.get("verdict") == b.get("verdict")),
     "write_fact": LLMNode("write_fact", nt.WriteFactOutput, "write_fact.md", _write_messages,
                           _write_shape, _write_agree, skip_reason=_write_skip,
-                          validate=lambda o, i, p: nt.NODE_TYPES["write_fact"].validator(
-                              o, {"changes": {"items": _changed(i.get("changes"))}}, p)),
+                          validate=lambda o, i, p: _write_validate(o, i, p)),
     "summarize": LLMNode("summarize", nt.SummarizeOutput, "summarize.md", _summ_messages,
                          _summ_shape, _summ_agree, skip_reason=_summ_skip,
                          validate=lambda o, i, p: nt.NODE_TYPES["summarize"].validator(o, i, p)),

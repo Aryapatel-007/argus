@@ -25,7 +25,8 @@ def waiting(env):
 
 
 def client(db_path, token="t0k"):
-    return TestClient(create_app(db_path, csrf_token=token))
+    # "testserver" is TestClient's Host header; production never allows it.
+    return TestClient(create_app(db_path, csrf_token=token, extra_hosts=("testserver",)))
 
 
 def test_pages_render_from_a_real_run(waiting):

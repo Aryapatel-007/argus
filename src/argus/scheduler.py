@@ -33,6 +33,9 @@ from argus.storage import db, lease
 PERIOD = {"daily": timedelta(days=1), "weekly": timedelta(days=7)}
 CRON = {"daily": {"hour": 7, "minute": 0}, "weekly": {"day_of_week": "mon", "hour": 7, "minute": 0}}
 MIN_NEW_FACTS_FOR_REFLECT = 2
+MAX_RECOVER_ATTEMPTS = 3
+#: A laptop asleep at the scheduled minute still runs the job when it wakes.
+GRACE_S = 6 * 3600
 
 
 def log(msg: str) -> None:
@@ -75,6 +78,7 @@ class Scheduler:
         self.interval_s = interval_s  # tests: every target every N seconds
         self.lock = asyncio.Lock()
         self.sched = None
+        self.failures: Dict[str, int] = {}
 
     async def watch(self, target: Dict[str, Any]) -> None:
         async with self.lock:
@@ -84,17 +88,27 @@ class Scheduler:
             log(f"watch {target['id']}: {out.status} {(out.digest or '')[:120]}")
 
     async def recover(self) -> None:
+        """Resume what a human decided FIRST (approved actions waiting), then
+        what a hard kill left behind. One failing run never blocks the rest
+        (Phase F review H1), and a run that keeps failing is parked after
+        MAX_RECOVER_ATTEMPTS so it cannot cost a resume every tick forever."""
         async with self.lock:
-            runs = interrupted_runs(Path(self.opts.db_path)) + app.decided_waiting_runs(Path(self.opts.db_path))
+            db_path = Path(self.opts.db_path)
+            runs = list(dict.fromkeys(app.decided_waiting_runs(db_path) + interrupted_runs(db_path)))
+            runs = [r for r in runs if self.failures.get(r, 0) < MAX_RECOVER_ATTEMPTS]
             if not runs:
                 return
             async with app.Session(self.opts) as s:
-                for run_id in dict.fromkeys(runs):
+                for run_id in runs:
                     try:
                         outs = await s.resume(run_id)
+                        self.failures.pop(run_id, None)
                         log(f"resumed {run_id}: {[o.status for o in outs]}")
                     except lease.LeaseLost:
                         log(f"{run_id} is owned by a live process; left alone")
+                    except Exception as exc:  # noqa: BLE001 - next run, not next tick
+                        self.failures[run_id] = self.failures.get(run_id, 0) + 1
+                        log(f"resume {run_id} failed ({self.failures[run_id]}/{MAX_RECOVER_ATTEMPTS}): {exc!r}")
 
     async def reflect(self, target: Dict[str, Any]) -> None:
         if new_facts_since_reflect(Path(self.opts.db_path), target["id"]) < MIN_NEW_FACTS_FOR_REFLECT:
@@ -120,21 +134,27 @@ class Scheduler:
         self.sched = AsyncIOScheduler(timezone="UTC")
         now = datetime.now(timezone.utc)
         for t in config.targets():
+            freq = t.get("frequency", "weekly")
+            if freq not in PERIOD and not t.get("schedule"):
+                log(f"target {t['id']}: unknown frequency {freq!r}, using weekly")
             if self.interval_s:
                 trigger = IntervalTrigger(seconds=self.interval_s)
             elif t.get("schedule"):
                 trigger = CronTrigger.from_crontab(t["schedule"])
             else:
-                trigger = CronTrigger(**CRON.get(t.get("frequency", "weekly"), CRON["weekly"]))
-            self.sched.add_job(self.watch, trigger, args=[t], id=f"watch:{t['id']}", max_instances=1,
-                               coalesce=True, misfire_grace_time=6 * 3600)
+                trigger = CronTrigger(**CRON.get(freq, CRON["weekly"]))
             last = last_watch(Path(self.opts.db_path), t["id"])
-            if self.interval_s or last is None or now - last > PERIOD.get(t.get("frequency"), PERIOD["weekly"]):
-                self.sched.add_job(self.watch, args=[t], id=f"catchup:{t['id']}")  # run now
+            catch_up = self.interval_s or last is None or now - last > PERIOD.get(freq, PERIOD["weekly"])
+            # ONE job per target: a catch-up is the same job fired now, so
+            # max_instances also stops a catch-up and a cron firing overlapping.
+            kw = {"next_run_time": now} if catch_up else {}
+            self.sched.add_job(self.watch, trigger, args=[t], id=f"watch:{t['id']}", max_instances=1,
+                               coalesce=True, misfire_grace_time=GRACE_S, **kw)
             self.sched.add_job(self.reflect, CronTrigger(day_of_week="sun", hour=8), args=[t],
-                               id=f"reflect:{t['id']}", max_instances=1, coalesce=True)
+                               id=f"reflect:{t['id']}", max_instances=1, coalesce=True, misfire_grace_time=GRACE_S)
         self.sched.add_job(self.recover, IntervalTrigger(minutes=10), id="recover", max_instances=1,
-                           coalesce=True, next_run_time=now)  # also right now: resume what a kill left
+                           coalesce=True, misfire_grace_time=GRACE_S,
+                           next_run_time=now)  # also right now: resume what a kill left
         self.sched.start()
         log(f"started: {[j.id for j in self.sched.get_jobs()]}")
 

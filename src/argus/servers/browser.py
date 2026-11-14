@@ -19,6 +19,13 @@ Rules this file keeps:
     (a politeness rate limit, not a readiness wait).
   - robots.txt is honoured for our user agent.
   - http(s) only. No downloads, no file://, no data:.
+  - Network boundary (Phase F review M2): every request the page makes is
+    filtered. Loopback, private, link-local and `localhost` addresses are
+    blocked unless they are the requested page's own host (the local fixture
+    site is), and a redirect to a different host is refused, so a watched
+    page cannot point the browser at the dashboard, Ollama or a LAN device.
+  - Bounded (review M3): reading the page after load is time-boxed, so a
+    page that busy-loops degrades instead of hanging the server.
 The orchestrator decides WHICH urls are allowed (same site as the target);
 this server only decides HOW to fetch politely.
 """
@@ -27,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import sys
 import time
 import urllib.robotparser
@@ -45,6 +53,45 @@ SERVER_NAME = "argus-browser"
 USER_AGENT = "ArgusMonitor/0.3 (local personal monitoring; +robots.txt respected)"
 MAX_TEXT_CHARS = 200_000
 MAX_LINKS = 200
+
+
+def _host_of(url: str) -> str:
+    """'host:port' (www. folded, default ports filled in). The port matters:
+    127.0.0.1:8765 (a fixture site) and 127.0.0.1:8787 (the dashboard) are
+    different origins."""
+    try:
+        u = urlparse(url)
+        h = (u.hostname or "").lower()
+        port = u.port or {"http": 80, "https": 443}.get(u.scheme)
+    except ValueError:
+        return ""
+    if not h:
+        return ""
+    h = h[4:] if h.startswith("www.") else h
+    return f"{h}:{port}"
+
+
+def _internal(host: str) -> bool:
+    # `host` is a _host_of key ("name:port", IPv6 without brackets): drop the port.
+    host = host.rsplit(":", 1)[0].strip("[]")
+    if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified
+
+
+def request_allowed(request_url: str, page_host: str) -> bool:
+    """A request made while rendering a page may go to the page's own host,
+    or to any PUBLIC host (scripts, styles). Never to another internal one."""
+    host = _host_of(request_url)
+    if not host:
+        return False
+    if host == page_host:
+        return True
+    return not _internal(host)
 
 
 def log(message: str) -> None:
@@ -72,8 +119,9 @@ class PageResult(BaseModel):
 
 class BrowserBackend:
     def __init__(self, *, throttle_s: float = 2.0, timeout_s: float = 30.0,
-                 idle_timeout_s: float = 8.0, respect_robots: bool = True):
+                 idle_timeout_s: float = 8.0, respect_robots: bool = True, read_timeout_s: float = 15.0):
         self.throttle_s = throttle_s
+        self.read_timeout_s = read_timeout_s
         self.timeout_ms = int(timeout_s * 1000)
         self.idle_timeout_ms = int(idle_timeout_s * 1000)
         self.respect_robots = respect_robots
@@ -87,6 +135,9 @@ class BrowserBackend:
 
     async def _ensure_browser(self):
         async with self._launch_lock:
+            if self._browser is not None and not self._browser.is_connected():
+                log("chromium disconnected; relaunching")  # review M4
+                self._browser = None
             if self._browser is None:
                 from playwright.async_api import async_playwright
 
@@ -123,6 +174,10 @@ class BrowserBackend:
                 if resp.ok:
                     parser = urllib.robotparser.RobotFileParser()
                     parser.parse((await resp.text()).splitlines())
+                elif resp.status >= 500:
+                    # RFC 9309: a server error on robots.txt means disallow.
+                    parser = urllib.robotparser.RobotFileParser()
+                    parser.parse(["User-agent: *", "Disallow: /"])
             except Exception as exc:  # noqa: BLE001 - no robots.txt reachable: allowed
                 log(f"robots.txt unavailable for {origin}: {exc!r}")
             self._robots[origin] = parser
@@ -141,10 +196,26 @@ class BrowserBackend:
             return PageResult(url=url, ok=False, partial=True, confidence=0.0,
                               error=f"browser unavailable: {exc!r}")
         await self._throttle(parts.hostname)
-        context = await browser.new_context(user_agent=USER_AGENT, accept_downloads=False,
-                                            java_script_enabled=True)
-        self.open_contexts += 1
         try:
+            context = await browser.new_context(user_agent=USER_AGENT, accept_downloads=False,
+                                                java_script_enabled=True)
+        except Exception as exc:  # noqa: BLE001 - Chromium died: relaunch next time, degrade now
+            self._browser = None
+            return PageResult(url=url, ok=False, partial=True, confidence=0.0,
+                              error=f"browser context failed: {exc!r}", elapsed_s=time.monotonic() - start)
+        self.open_contexts += 1
+        page_host = _host_of(url)
+        blocked: List[str] = []
+
+        async def guard(route):
+            if request_allowed(route.request.url, page_host):
+                await route.continue_()
+            else:
+                blocked.append(route.request.url)
+                await route.abort("blockedbyclient")
+
+        try:
+            await context.route("**/*", guard)
             if not await self._robots_allows(context, url):
                 return PageResult(url=url, ok=False, partial=True, confidence=0.0,
                                   error="disallowed by robots.txt", elapsed_s=time.monotonic() - start)
@@ -155,16 +226,31 @@ class BrowserBackend:
                 return PageResult(url=url, ok=False, partial=True, confidence=0.0,
                                   error=f"navigation failed: {type(exc).__name__}: {str(exc)[:300]}",
                                   elapsed_s=time.monotonic() - start)
+            if _host_of(page.url) != page_host:
+                return PageResult(url=url, final_url=page.url, ok=False, partial=True, confidence=0.0,
+                                  error=f"redirected to another origin ({_host_of(page.url)}); refused",
+                                  elapsed_s=time.monotonic() - start)
             settled = True
             try:
                 await page.wait_for_load_state("networkidle", timeout=self.idle_timeout_ms)
             except Exception:  # noqa: BLE001 - the network never went quiet
                 settled = False
             status = response.status if response is not None else None
-            title = await page.title()
-            text = (await page.inner_text("body"))[:MAX_TEXT_CHARS] if await page.query_selector("body") else ""
-            raw_links = await page.eval_on_selector_all(
-                "a[href]", "els => els.map(e => [e.innerText || e.textContent || '', e.getAttribute('href')])")
+            page.set_default_timeout(int(self.read_timeout_s * 1000))
+
+            async def read():
+                title = await page.title()
+                text = (await page.inner_text("body"))[:MAX_TEXT_CHARS] if await page.query_selector("body") else ""
+                raw = await page.eval_on_selector_all(
+                    "a[href]", "els => els.map(e => [e.innerText || e.textContent || '', e.getAttribute('href')])")
+                return title, text, raw
+
+            try:
+                title, text, raw_links = await asyncio.wait_for(read(), timeout=self.read_timeout_s)
+            except asyncio.TimeoutError:
+                return PageResult(url=url, final_url=page.url, status=status, ok=False, partial=True,
+                                  confidence=0.0, error=f"page did not respond within {self.read_timeout_s}s "
+                                  "after loading (script busy?)", elapsed_s=time.monotonic() - start)
             base = page.url
             links = []
             for label, href in raw_links[:MAX_LINKS * 2]:
@@ -188,7 +274,10 @@ class BrowserBackend:
                               error=f"{type(exc).__name__}: {str(exc)[:300]}", elapsed_s=time.monotonic() - start)
         finally:
             try:
-                await context.close()
+                await asyncio.wait_for(context.close(), timeout=10)
+            except Exception as exc:  # noqa: BLE001 - a wedged renderer: drop this browser
+                log(f"context close failed ({exc!r}); browser will be relaunched")
+                self._browser = None
             finally:
                 self.open_contexts -= 1
 
