@@ -5,26 +5,57 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** G (prove the complexity earns its place) — benchmark RUNNING
+- **Phase:** G — STOPPED before a valid benchmark; fix delta-review findings first
 - **Branch:** main. Phases A-F merged (`wip/phase-e`, `wip/phase-f` kept).
 - **Test count:** 409 passing. Never drops.
 - **Mutation check:** 22/22 killed. **Security scan:** 0 blocking
   (`notes/security-audit-phase-f.md`).
 - **Blocked:** no
 
-## In flight (check these first when resuming)
+## STOPPED (usage limit, 2026-11-14 ~17:55). Resume here.
 
-1. `scripts/phase_g.py` launched detached (Start-Process) at ~17:37 on
-   2026-11-14, logs `data/phase-g.log` / `data/phase-g.err.log`. Order:
-   judge calibration -> baseline -> fixed -> learning warm-up -> learning.
-   Outputs: `notes/eval/*.json`, `notes/eval/judge-calibration.json`,
-   `notes/eval/phase-g-table.md`. Eval DBs in `data/eval/`.
-   If it died: rerun `python scripts/phase_g.py` (each mode starts fresh).
-   Do NOT run the test suite, the mutation check or other Ollama work while
-   it runs: wall-clock time is one of the measured metrics.
-2. A delta review of the Phase F fixes + eval harness (commit a26c456) was
-   running read-only. If its findings are not reflected in the log below,
-   re-run the `reviewer` agent on `git show a26c456` after Phase G finishes.
+Phase G run was STOPPED on purpose after 13 baseline scenarios (all q=1.0
+except s13 0.33, ~40-67s each, 0 swaps, 0 gate violations; see
+data/phase-g.log). Its numbers must NOT be used: a delta review of commit
+a26c456 found flaws that bias the benchmark. Fix these FIRST, with tests,
+then rerun `python scripts/phase_g.py` (detached; no other Ollama work
+while it runs). Judge calibration from that run: gemma4:e4b 0.83, qwen3.5:9b
+0.79, phi4-mini 0.29, llama3.1 0.29 (check judge-calibration.json: 0.29 may
+be invalid-JSON counted as disagreement).
+
+Delta review findings (all open):
+- H-B `llm_nodes.still_stated` unanchored substring: "IELTS overall 6" is
+  "stated" on a page saying 6.5; also 12 vs 120, 45,000 vs 45,000,000, list
+  extended after the old text; a stored "." matches everything. Anchor on
+  word/number boundaries + sentence end; empty canon = not stated; tests.
+- H-A browser.py: `context.route` sees only the FIRST url of a redirect
+  chain, so HTTP 30x hops (top-level goto and subresources) reach internal
+  hosts; robots fetch via context.request follows redirects unrouted. Fix:
+  route.fetch(max_redirects=0) + re-check Location, max_redirects=0 on
+  robots; add HTTP-302 tests (subresource and top level) with `other.hits`.
+- M-A s08 needs `silent=True, kinds={"fees": "unchanged"}`; consider a
+  symmetric equivalence check in still_stated (same numbers + mutual high
+  overlap) so a re-worded extraction is not "modified".
+- M-B scheduler.reflect (and start_run failing after its first commit)
+  strands the lease like M1 did; share the release helper; test.
+- M-C recover cap: in-memory, permanent, silent. Use backoff + a visible
+  marker (runs.status 'parked' + dashboard row).
+- M-D harness: judge loads a different model between scenarios, biasing the
+  next scenario's routing and wall time. Judge AFTER all scenarios of a mode.
+- M-E harness: score "all expected runs completed with acceptable graph
+  status" (except s24); today a failed last run can pass vacuously.
+- M-F harness gate metric: count any approval status != pending (incl.
+  failed) or resolved_at set; scan approvals.proposed_action for forbidden
+  tokens (s12 exists for that).
+- M-G browser: http->https upgrade refused (port in origin key); align with
+  handlers.same_site.
+- M-H browser `_internal`: trailing-dot localhost, 100.64/10 (use
+  `not ip.is_global`); DNS-to-private names remain a documented residual.
+- Lows: old Chromium/driver not closed on relaunch; IDN punycode vs unicode
+  host; robots network error should mean disallow; busy-loop test assertion
+  weak; judge gets pipeline diff items as "ground truth" (state this in the
+  Phase G write-up); procedural memory contributes nothing to the measured
+  learning pass (state it).
 
 ## Then
 
