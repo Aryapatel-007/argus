@@ -5,83 +5,71 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** E done and merged to main. F in progress (steps 1-2 done).
-- **Branch:** main (`wip/phase-e` merged; kept, not deleted).
-- **Test count:** 368 passing. Never drops.
-- **Mutation check:** 20/20 killed. **Security scan:** 0 blocking.
+- **Phase:** G (prove the complexity earns its place) — benchmark RUNNING
+- **Branch:** main. Phases A-F merged (`wip/phase-e`, `wip/phase-f` kept).
+- **Test count:** 409 passing. Never drops.
+- **Mutation check:** 22/22 killed. **Security scan:** 0 blocking
+  (`notes/security-audit-phase-f.md`).
 - **Blocked:** no
+
+## In flight (check these first when resuming)
+
+1. `scripts/phase_g.py` launched detached (Start-Process) at ~17:37 on
+   2026-11-14, logs `data/phase-g.log` / `data/phase-g.err.log`. Order:
+   judge calibration -> baseline -> fixed -> learning warm-up -> learning.
+   Outputs: `notes/eval/*.json`, `notes/eval/judge-calibration.json`,
+   `notes/eval/phase-g-table.md`. Eval DBs in `data/eval/`.
+   If it died: rerun `python scripts/phase_g.py` (each mode starts fresh).
+   Do NOT run the test suite, the mutation check or other Ollama work while
+   it runs: wall-clock time is one of the measured metrics.
+2. A delta review of the Phase F fixes + eval harness (commit a26c456) was
+   running read-only. If its findings are not reflected in the log below,
+   re-run the `reviewer` agent on `git show a26c456` after Phase G finishes.
+
+## Then
+
+- Write `notes/routing-results.md`: the table from
+  `notes/eval/phase-g-table.md` plus an honest reading (where the graph
+  engine wins or loses: quality, wall clock, swaps, timeouts, gate
+  violations = 0 required in all three). If the learning engine does not
+  beat the baseline after real effort: `BLOCKED: needs Arya` (ARGUS_BUILD 8).
+- Check the definition of done (ARGUS_BUILD 9) item by item and update
+  README/CLAUDE.md/this file.
 
 ## Phase log
 
-- **A** (e90c596) deps pinned, Browser Use/deepeval/Streamlit rejected
-  (telemetry). `notes/environment.md`.
-- **B** (3a7d52d) 10 Opus agents in `.claude/agents/` (D-007).
-- **C** (30aade1) `notes/audit.md`: C1 gate-after-tool, H1-H3 fixed, plus
-  reviewer findings on the fixes. Migrations 003 (leases), 004 (receipts).
-- **D** (687ce95) Trail of Bits property-based-testing installed; 4 project
-  skills; `scripts/security_scan.py`, `scripts/mutation_check.py`.
-- **E** steps 1-3 (ab58aeb), step 2 (2cc6de3) on main; steps 4-12 on
-  wip/phase-e:
-  - config: `config/models.yaml` (allowlist, named `baseline` and `embed`,
-    no tiers, D-021), `config/routing.yaml` (all router/scheduler knobs).
-  - `graph/llm.py` async backend (think=False top-level, 120s wall cap,
-    every call logged), `llm_nodes.py` + `prompts/` (all page-derived text
-    fenced and escaped), `registry.py`, `router.py` (score breakdown stored,
-    Thompson sampling with bounded exploration, swap-aware, D-017/D-018),
-    `bandit.py` (rewards in the node's own transaction), `health.py`
-    (half-open breaker), `strategies.py` (single, reflexion_retry, cascade,
-    cross_model, self_consistency, low-confidence second opinion; samples
-    stored and reused), `handlers.py` (all node types; executor claims the
-    approval first, D-023), `engine.py` (two lanes, swap-aware batching,
-    retries as nodes, triggers -> replan, gate resolution, budgets,
-    lease per graph), `procedural.py` (template outcomes, learned hints shown
-    to the planner), `fakes.py`, `runner.py` (CLI).
-  - `scripts/profile_models.py` ran on the real pool: `notes/model-profiles.md`,
-    findings in `notes/phase-e-measurements.md` (co-residency is
-    load-order-dependent; think="low" still thinks).
-  - Tests: engine end to end, router/bandit/health, expansion + procedural,
-    review fixes, and REAL-KILL crash tests (`tests/test_graph_crash.py`):
-    7 in-call kill points + 2 execute windows + live-lease refusal.
-  - Two reviewer passes. First: 2 high + 8 medium, all fixed
-    (`tests/test_graph_review_fixes.py`). Delta review of those fixes: 1 high
-    (a malformed port crashed the engine on every resume) + 3 medium, all
-    fixed (`tests/test_graph_delta_fixes.py`). Decisions D-016 to D-024.
-- **F** step 1: `graph/mcp_clients.py` (McpMemory/McpBrowser over stdio,
-  RunMemory owns the per-run spawn; runner defaults to `--memory mcp`).
-  Step 2: every graph crash test now runs the memory server as a real MCP
-  subprocess, including the kill right after `remember` committed, and
-  asserts by process listing that the server dies with its killed parent
-  (Windows Job Object verified, not assumed).
+- **A** (e90c596) deps pinned, Browser Use/deepeval/Streamlit rejected.
+- **B** (3a7d52d) 10 Opus agents (D-007).
+- **C** (30aade1) audit, C1/H1-H3 fixed, migrations 003-004.
+- **D** (687ce95) skills: Trail of Bits PBT + 4 project skills, scanner,
+  mutation check.
+- **E** (merged d1e7ace) graph engine, router, strategies, real-kill crash
+  tests, profiler. Three reviewer passes. D-012..D-024.
+- **F** (merged e1b13a7) memory + browser MCP servers spawned per run (kill
+  tests verify no orphans across the whole process tree), watch, approvals
+  CLI + dashboard, observability, APScheduler with hard-kill recovery test,
+  eval harness (24 scenarios, judge + calibration), README, demo. Reviewer
+  pass fixed 1 high + 4 medium. D-025, D-026.
 
-## Next steps
+## Measurements worth knowing
 
-1. Phase F (ARGUS_BUILD.md section 7), remaining:
-   3. Browser MCP server (`servers/browser.py`, raw Playwright, D-002):
-      `open_page` returns text + links + confidence, degrades instead of
-      raising, per-domain throttle, real wait conditions, closes contexts.
-      Then re-measure co-residency with Chromium running.
-   4. Watch logic over config/targets.yaml (one graph per target per run).
-   5. Approval CLI (`argus approvals list/approve/reject`) + dashboard.
-   6. Dashboard (FastAPI + Jinja2, 127.0.0.1, CSRF on POST): runs, trace
-      tree, routing explanations, approvals, model health.
-   7. Eval harness: 20-30 scenarios on local fixture pages, judge != judged
-      model, calibration against a hand-labelled set.
-   8. APScheduler + hard-kill test + reflect (consolidation) schedule.
-   9. One-command start, README, demo script. Security scan again.
-2. Phase G: baseline vs fixed vs learning on identical scenarios ->
-   `notes/routing-results.md`.
+- `notes/model-profiles.md`, `notes/phase-e-measurements.md`: phi4-mini ~81
+  tok/s fully on GPU; qwen3.5:9b ~25 tok/s, 71% on GPU; llama3.1 ~51 tok/s;
+  gemma4:e4b 32% on GPU. Co-residency is load-order-dependent; with Chromium
+  running only llama3.1+nomic and phi4-mini+nomic are co-resident both ways.
+- First real-model smoke (s02, baseline): quality 0.75, 72s per two-run
+  scenario.
 
 ## Backlog (medium/low)
 
-- Audit leftovers: M2, M3 (superseded by the graph engine), M6 (legacy
-  log_call), M7 (typed memory-server errors), M8 (sync sqlite in async
+- Audit leftovers: M7 (typed memory-server errors), M8 (sync sqlite in async
   tools), L1, L4-L13, L15.
-- Review lows not yet done: profiler think/load calls write no llm_calls rows
-  and use only httpx per-phase timeouts; `backup_if_pending` name collision
-  within one second; bandit/health/log_call writes are not lease-guarded
-  (observability/learning rows, deliberate).
-- Fixtures saturate (most node types score 1.0 for every model); the eval
-  harness must add harder cases so Phase G can separate models.
+- Browser: hostnames that resolve to private IPs are not filtered (IP
+  literals and localhost are). Accepted while targets come from the owner.
+- Profiler think/load calls write no llm_calls rows; `backup_if_pending`
+  name collision within one second.
+- Fixtures in `eval/node_fixtures.py` saturate (most models score 1.0); the
+  24 scenarios are the harder set.
 
 ## Questions for Arya (non-blocking)
 
