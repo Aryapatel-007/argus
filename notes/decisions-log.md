@@ -133,3 +133,50 @@ flock elsewhere) around the whole run, connect included, and also re-checks
 **Why:** review H-1 measured two processes racing on the very first
 `PRAGMA journal_mode = WAL` of a fresh file, before any transaction exists,
 and the no-transaction path (001c) cannot be protected by a transaction.
+
+## D-012 — Model pool from models already on disk; no engine upgrade mid-build
+
+**Chose:** pool = qwen3.5:9b, phi4-mini (smallest chat model, the cheap
+classifier/router candidate), llama3.1:8b (Meta family, for critique
+independence from Qwen), gemma4:e4b (Google family; 9.6GB on disk, so the
+profiler decides whether its offload makes it usable), nomic-embed-text.
+**Rejected:** pulling gemma3:4b and qwen3.5:2b (both fail on Ollama 0.24.0:
+"download the latest version"); upgrading Ollama to 0.40.x now;
+deepseek-r1:8b (always-reasoning, think=False not guaranteed);
+llama3.2-vision (7.8GB vision model, wrong job); `sunday` (custom, unknown
+base).
+**Why:** an engine upgrade invalidates every measurement in notes/ and the
+profiler priors. The pool still covers four families and three sizes. The
+upgrade is a question for Arya, not a silent change.
+
+## D-013 — Retries are new nodes; critique passes facts through on PASS
+
+**Chose:** a failed node gets a clone (attempt+1, `retry_root` = original)
+wired to the same parents and children; inputs on one channel are satisfied
+by the highest done attempt of one retry chain. `critique` provides the
+`facts` channel only when its verdict is pass, so nothing downstream of
+`extract` ever sees unreviewed facts; a rejected extract is retried as a new
+(extract', critique') pair with the critic's reflection in the params.
+**Rejected:** back edges for retries (breaks the DAG invariant and the
+validator); letting resolve/diff consume extract output in parallel with the
+critic (they would run on facts the critic later rejects).
+**Why:** ARGUS_BUILD 6.5 requires a DAG. Routing data through the critic makes
+"only reviewed facts are stored" structural.
+
+## D-014 — Planner picks templates; it never emits raw graph structure
+
+**Chose:** `plan`/`replan` output is a list of (template name, params);
+the engine instantiates templates into nodes and edges and validates the
+result before storing it.
+**Rejected:** free-form node/edge lists from the model.
+**Why:** small local models are reliable at "pick from a list and fill
+fields" and unreliable at emitting DAGs. It also makes the planner's choices
+countable, which is what procedural memory (template success rates) needs.
+
+## D-015 — `search` is link search inside a fetched page, not a web search API
+
+**Chose:** `search` ranks the links of an already fetched page by keyword
+overlap and returns the best same-domain URL.
+**Rejected:** a public search engine endpoint.
+**Why:** constraint 3. A search query is target data sent to a third party;
+following a link on the target's own site is not.

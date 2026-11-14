@@ -7,7 +7,7 @@ then ARGUS_BUILD.md.
 
 - **Phase:** E (graph engine), step 1-3 written, not yet committed
 - **Last completed:** Phase D, testing and audit skills
-- **Test count:** 230 at the Phase D commit (179 at baseline). Must never drop.
+- **Test count:** 253 at the E1+E3 commit (230 at Phase D) (179 at baseline). Must never drop.
 - **Blocked:** no
 
 ## Phase log
@@ -61,9 +61,9 @@ Spec: `notes/specs/graph-engine.md`. Package `src/argus/graph/`.
 
 | Step | Status |
 |---|---|
-| 1 node type registry | written (`graph/nodes.py`), committed with step 3 |
+| 1 node type registry | done (`graph/nodes.py`) |
 | 2 graph model + migration | model written (`graph/model.py`); migrations 005-007 not yet |
-| 3 validator + property tests | written (`graph/validator.py`, `templates.py`, `tests/test_graph_validator.py`, 23 tests incl. 2 negative controls) |
+| 3 validator + property tests | done: (`graph/validator.py`, `templates.py`, `tests/test_graph_validator.py`, 23 tests incl. 2 negative controls) |
 | 4-12 | not started |
 
 Model pool (decided, D-012 pending in log): qwen3.5:9b, phi4-mini,
