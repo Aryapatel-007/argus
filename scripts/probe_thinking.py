@@ -47,7 +47,7 @@ def print_versions() -> None:
 
 
 def call(client: Client, extra_kwargs: dict):
-    return client.chat(
+    return client.chat(  # security-scan: ok think is the variable under test, passed via extra_kwargs
         model=MODEL,
         messages=[{"role": "user", "content": PROMPT}],
         keep_alive="10m",
