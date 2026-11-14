@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %} &middot; why {{ why.node_id }}{% endblock %}
+{% block body %}
+<h2>Why this model? <span class="mono">{{ why.node_id }}</span></h2>
+{% for d in why.decisions %}
+<div class="card">
+<b>{{ d.model_tag }}</b> &middot; {{ d.strategy }} &middot; mode {{ d.mode }}
+{% if d.superseded %}<span class="muted">(superseded)</span>{% endif %}
+{% if d.explore %}<span class="s-pending">exploration</span>{% endif %}
+{% if d.frozen %}<span class="muted">frozen at start</span>{% endif %}
+<p>{{ d.reason }}</p>
+<div class="scroll"><table>
+<tr><th>Candidate</th><th>Utility</th><th>Quality (sampled / mean)</th><th>Latency s</th><th>Swap s</th><th>Risk</th><th>Resident</th><th>Health</th><th>Excluded</th></tr>
+{% for c in d.candidates %}
+<tr><td>{{ c.model }}</td><td>{{ c.utility }}</td><td>{{ c.quality }} / {{ c.quality_mean }}</td>
+<td>{{ c.latency_s }}</td><td>{{ c.swap_s }}</td><td>{{ c.risk }}</td><td>{{ "yes" if c.resident else "" }}</td>
+<td class="s-{{ c.health }}">{{ c.health }}</td><td>{{ c.excluded or "" }}</td></tr>
+{% endfor %}
+</table></div></div>
+{% else %}<p class="muted">No routing decision: this node does not call a model.</p>{% endfor %}
+{% endblock %}

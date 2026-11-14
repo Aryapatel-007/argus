@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block body %}
+{% if pending %}<div class="card"><b>{{ pending|length }} approval{{ "s" if pending|length != 1 }} waiting.</b>
+<a href="/approvals">Review</a></div>{% endif %}
+<h2>Recent runs</h2>
+<div class="scroll"><table>
+<tr><th>Started (UTC)</th><th>Run</th><th>Target</th><th>Kind</th><th>Status</th><th>Nodes</th><th>Model calls</th><th>Tokens</th></tr>
+{% for r in runs %}
+<tr><td class="mono">{{ r.started_at }}</td><td class="mono"><a href="/runs/{{ r.run_id }}">{{ r.run_id }}</a></td>
+<td>{{ r.target_id }}</td><td>{{ r.kind or "legacy" }}</td>
+<td class="s-{{ r.graph_status or r.status }}">{{ r.graph_status or r.status }}</td>
+<td>{{ r.nodes or 0 }}</td><td>{{ r.calls or 0 }}</td><td>{{ r.tokens_used or 0 }}</td></tr>
+{% else %}<tr><td colspan="8" class="muted">No runs yet. Try <code>argus watch</code>.</td></tr>{% endfor %}
+</table></div>
+<h2>Models</h2>
+<table><tr><th>Model</th><th>Status</th><th>Recent tok/s</th><th>Profiled tok/s</th></tr>
+{% for h in health %}<tr><td>{{ h.model }}</td><td class="s-{{ h.status }}">{{ h.status }}</td>
+<td>{{ "%.1f"|format(h.recent_tok_s) if h.recent_tok_s else "-" }}</td>
+<td>{{ "%.1f"|format(h.profile.tok_s) if h.profile.tok_s else "-" }}</td></tr>{% endfor %}
+</table>
+{% endblock %}

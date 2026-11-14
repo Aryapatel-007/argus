@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %} &middot; approvals{% endblock %}
+{% block body %}
+<h2>Approvals</h2>
+<p class="muted">Nothing leaves this machine until it is approved here or with <code>argus approvals approve ID</code>.
+Approved actions run when the scheduler next resumes the run, or with <code>argus resume-decided</code>.</p>
+{% for r in rows %}
+<div class="card">
+<b>#{{ r.approval_id }}</b> &middot; <span class="s-{{ r.status }}">{{ r.status }}</span> &middot; {{ r.target_id }} &middot; {{ r.action_kind }}
+<span class="muted mono">{{ r.created_at }}</span>
+<p><b>{{ r.action.subject }}</b><br>{{ r.action.body }}</p>
+<p class="muted">Why: {{ r.reasoning }}{% if r.decided_by %} &middot; decided by {{ r.decided_by }}{% endif %}{% if r.decision_note %}: {{ r.decision_note }}{% endif %}</p>
+{% if r.status == "pending" %}
+<form method="post" action="/approvals/{{ r.approval_id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="decision" value="approve">
+<button class="approve">Approve</button></form>
+<form method="post" action="/approvals/{{ r.approval_id }}">
+<input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="decision" value="reject">
+<button class="reject">Reject</button></form>
+{% endif %}
+</div>
+{% else %}<p class="muted">No approvals yet.</p>{% endfor %}
+{% endblock %}

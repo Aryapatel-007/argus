@@ -224,6 +224,71 @@ def test_kill_during_the_approved_action_executes_it_exactly_once(tmp_path, when
     assert final["duplicate"] is (when == "after_effect")
 
 
+def _descendants(pid: int):
+    """Every process below pid (children, grandchildren...), by process listing."""
+    if sys.platform != "win32":
+        return []
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.ParentProcessId)\" }"],
+        capture_output=True, text=True, timeout=60)
+    children = {}
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and all(p.isdigit() for p in parts):
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, stack = [], [pid]
+    while stack:
+        for c in children.get(stack.pop(), []):
+            if c not in found:
+                found.append(c)
+                stack.append(c)
+    return found
+
+
+def test_real_browser_and_memory_servers_end_to_end_with_a_kill_mid_fetch(tmp_path):
+    """Production wiring minus Ollama: runner -> memory MCP server -> browser
+    MCP server -> Chromium -> a local site. Kill the runner while a page is
+    loading; every descendant must die; the resumed run must finish."""
+    from argus.eval.fixture_server import FixtureServer
+    page = ("<html><head><title>Master of AI</title></head><body><p>Master of Artificial Intelligence. "
+            "Duration: 2 years full-time. Intakes: February and July each year. The annual tuition fee "
+            "for 2027 is AUD 45,000. Entry requires a bachelor degree with a WAM of 65.</p></body></html>")
+    with FixtureServer({"/uni/master-ai": page}, slow_paths={"/uni/master-ai": 4.0}) as site:
+        case = Case(tmp_path, "browser")
+        target = {**TARGET, "url": site.url("/uni/master-ai")}
+        (case.dir / "target.json").write_text(json.dumps(target), encoding="utf-8")
+        base = [sys.executable, "-m", "argus.graph.runner", "--db", str(case.db), "--outbox", str(case.outbox),
+                "--fake-backend", "--fake-embed", "--models", "model-a:latest", "model-b:latest"]
+        proc = subprocess.Popen(base + ["--target-json", str(case.dir / "target.json"), "--run-id", case.run_id],
+                                cwd=REPO, env=_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            _wait_running(case, "fetch_page", proc)
+            deadline = time.time() + 30
+            while time.time() < deadline and site.hits["/uni/master-ai"] == 0:
+                time.sleep(0.1)  # the browser is now waiting on the slow page
+            tree = _descendants(proc.pid)
+        finally:
+            proc.kill()
+            proc.wait(timeout=30)
+        if sys.platform == "win32":
+            assert len(tree) >= 3, f"expected memory server, browser server and Chromium below the runner: {tree}"
+        from argus.storage.lease import pid_alive
+        deadline = time.time() + 20
+        while time.time() < deadline and any(pid_alive(p) for p in tree):
+            time.sleep(0.3)
+        assert not [p for p in tree if pid_alive(p)], "a server or Chromium outlived the killed runner"
+
+        site.slow_paths.clear()
+        p = subprocess.run(base + ["--resume", case.run_id], cwd=REPO, env=_env(),
+                           capture_output=True, text=True, timeout=300)
+        assert p.returncode == 4, p.stderr[-3000:]
+        facts = {r["entity_key"] for r in case.q("SELECT entity_key FROM facts WHERE is_current = 1")}
+        assert facts == set(TARGET["extract"])
+        src = {r["source_url"] for r in case.q("SELECT source_url FROM facts")}
+        assert src == {target["url"]}
+
+
 def test_a_second_resume_while_the_first_is_alive_is_refused(tmp_path):
     case = Case(tmp_path, "lease")
     proc = case.start(hang="extract:0")

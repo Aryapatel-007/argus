@@ -294,6 +294,18 @@ def write_notes(db_path: Path, models: List[str]) -> Path:
     return out
 
 
+def _start_browser():
+    """Headless Chromium with a page open, as during a real run (ARGUS_BUILD
+    7.3: re-measure co-residency with the browser running)."""
+    from playwright.sync_api import sync_playwright
+
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    page = browser.new_page()
+    page.set_content("<html><body><p>" + "Argus co-residency probe. " * 2000 + "</p></body></html>")
+    return pw, browser
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=str(db.DB_PATH))
@@ -301,6 +313,9 @@ def main(argv=None) -> int:
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--skip-coresidency", action="store_true")
     ap.add_argument("--skip-think-levels", action="store_true")
+    ap.add_argument("--coresidency-only", action="store_true")
+    ap.add_argument("--with-browser", action="store_true",
+                    help="keep headless Chromium running while measuring co-residency")
     args = ap.parse_args(argv)
 
     db_path = Path(args.db)
@@ -312,17 +327,26 @@ def main(argv=None) -> int:
     prof = Profiler(db_path, args.repeats)
     prof.skip_levels = args.skip_think_levels
     status = "failed"
+    browser = None
     try:
-        for m in models:
-            try:
-                prof.profile_model(m)
-            except Exception as exc:  # noqa: BLE001 - one bad model must not lose the rest
-                log(f"!! {m} failed: {exc!r}")
-                prof.put(m, "*", "profile_error", 1.0, 0, {"error": repr(exc)})
+        if not args.coresidency_only:
+            for m in models:
+                try:
+                    prof.profile_model(m)
+                except Exception as exc:  # noqa: BLE001 - one bad model must not lose the rest
+                    log(f"!! {m} failed: {exc!r}")
+                    prof.put(m, "*", "profile_error", 1.0, 0, {"error": repr(exc)})
         if not args.skip_coresidency:
+            if args.with_browser:
+                browser = _start_browser()
+                log("chromium running during co-residency measurement")
             prof.coresidency(models)
         status = "done"
     finally:
+        if browser is not None:
+            pw, b = browser
+            b.close()
+            pw.stop()
         prof.unload_all()
         prof.close(status)
     log(f"notes: {write_notes(db_path, models)}")

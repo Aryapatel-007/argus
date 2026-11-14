@@ -108,7 +108,8 @@ class McpBrowser(_StdioTool):
         super().__init__("argus.servers.browser", list(extra_args or []))
 
     async def open_page(self, url: str) -> Dict[str, Any]:
-        await self.open()
+        # The owner must open() first, in the task that will close() it
+        # (anyio cancel scopes are task-bound). No lazy open here.
         return await self.call("open_page", {"url": url})
 
 

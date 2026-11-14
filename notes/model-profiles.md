@@ -1,6 +1,6 @@
 # Model profiles
 
-Written by `scripts/profile_models.py` on 2026-11-14 13:00. Live numbers from this machine; the router reads them from `model_profiles`.
+Written by `scripts/profile_models.py` on 2026-11-14 17:11. Live numbers from this machine; the router reads them from `model_profiles`.
 
 ## Model-wide
 
@@ -16,7 +16,7 @@ Written by `scripts/profile_models.py` on 2026-11-14 13:00. Live numbers from th
 | node type | qwen3.5:9b | phi4-mini:latest | llama3.1:latest | gemma4:e4b |
 |---|---|---|---|---|
 | critique | 1.00 / 1.00 / 1.00 / 2.2 | 1.00 / 1.00 / 1.00 / 1.4 | 1.00 / 1.00 / 1.00 / 1.5 | 1.00 / 1.00 / 1.00 / 2.0 |
-| entity_match | 0.67 / 1.00 / 1.00 / 0.8 | 0.67 / 1.00 / 1.00 / 0.6 | 1.00 / 1.00 / 1.00 / 0.7 | 1.00 / 1.00 / 1.00 / 0.8 |
+| entity_match | - / - / - / - | - / - / - / - | - / - / - / - | - / - / - / - |
 | extract | 1.00 / 1.00 / 1.00 / 6.8 | 1.00 / 1.00 / 1.00 / 4.5 | 1.00 / 1.00 / 1.00 / 3.6 | 1.00 / 1.00 / 1.00 / 3.6 |
 | plan | 1.00 / 1.00 / 1.00 / 3.5 | 1.00 / 1.00 / 1.00 / 3.9 | 1.00 / 1.00 / 1.00 / 2.8 | 1.00 / 1.00 / 1.00 / 2.9 |
 | propose_action | 1.00 / 1.00 / 1.00 / 5.5 | 1.00 / 1.00 / 0.00 / 3.5 | 1.00 / 1.00 / 1.00 / 3.2 | 1.00 / 1.00 / 1.00 / 3.5 |
@@ -27,8 +27,8 @@ Written by `scripts/profile_models.py` on 2026-11-14 13:00. Live numbers from th
 ## Co-residency (both stayed loaded together)
 
 - gemma4:e4b + llama3.1:latest: no
-- gemma4:e4b + nomic-embed-text:latest: yes
-- gemma4:e4b + phi4-mini:latest: yes
+- gemma4:e4b + nomic-embed-text:latest: no
+- gemma4:e4b + phi4-mini:latest: no
 - gemma4:e4b + qwen3.5:9b: no
 - llama3.1:latest + nomic-embed-text:latest: yes
 - llama3.1:latest + phi4-mini:latest: no

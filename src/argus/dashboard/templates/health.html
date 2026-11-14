@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %} &middot; model health{% endblock %}
+{% block body %}
+<h2>Model health</h2>
+{% for h in health %}
+<div class="card">
+<b>{{ h.model }}</b> &middot; <span class="s-{{ h.status }}">{{ h.status }}</span>{% if h.reason %} &middot; {{ h.reason }}{% endif %}
+<p class="muted">Recent: {{ "%.1f"|format(h.recent_tok_s) if h.recent_tok_s else "-" }} tok/s over {{ h.recent_calls }} calls,
+{{ h.recent_timeouts or 0 }} timeouts. Profiled: {{ "%.1f"|format(h.profile.tok_s) if h.profile.tok_s else "-" }} tok/s,
+cold load {{ "%.1f"|format(h.profile.cold_load_s) if h.profile.cold_load_s else "-" }}s,
+GPU share {{ "%.0f%%"|format(100 * h.profile.gpu_fraction) if h.profile.gpu_fraction is not none else "-" }}.</p>
+{% if h.arms %}<table><tr><th>Node type</th><th>Posterior mean</th><th>&alpha;</th><th>&beta;</th><th>Rewards</th></tr>
+{% for a in h.arms %}<tr><td>{{ a.node_type }}</td><td>{{ "%.2f"|format(a.alpha / (a.alpha + a.beta)) }}</td>
+<td>{{ "%.1f"|format(a.alpha) }}</td><td>{{ "%.1f"|format(a.beta) }}</td><td>{{ a.pulls }}</td></tr>{% endfor %}
+</table>{% endif %}
+</div>
+{% else %}<p class="muted">No models profiled yet: run <code>python scripts/profile_models.py</code>.</p>{% endfor %}
+{% endblock %}
