@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Argus{% block title %}{% endblock %}</title>
+<style>
+  :root { --bg:#fbfaf7; --fg:#1d1d1b; --muted:#6b6a65; --line:#e3e0d8; --ok:#2f7d4f; --warn:#a46a00; --bad:#b3261e; --accent:#2c5d8f; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16171a; --fg:#e8e6e1; --muted:#9a978f; --line:#2b2c30; --ok:#5fbf86; --warn:#e0a640; --bad:#ef6b62; --accent:#7fb0e0; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; gap:20px; align-items:baseline; padding:14px 20px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header b { font-size:18px; letter-spacing:.5px; }
+  nav a { color:var(--accent); margin-right:14px; text-decoration:none; }
+  main { padding:16px 20px; max-width:1200px; }
+  table { border-collapse:collapse; width:100%; margin:8px 0 20px; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .s-done, .s-healthy, .s-approved, .s-executed { color:var(--ok); }
+  .s-running, .s-waiting_approval, .s-pending, .s-blocked, .s-ready, .s-trial { color:var(--warn); }
+  .s-failed, .s-rejected, .s-degraded { color:var(--bad); }
+  .s-skipped { color:var(--muted); }
+  code, .mono { font-family: ui-monospace, Consolas, monospace; font-size:13px; }
+  .muted { color:var(--muted); }
+  .card { border:1px solid var(--line); border-radius:6px; padding:12px 14px; margin:10px 0; }
+  form { display:inline; }
+  button { font:inherit; padding:4px 12px; border-radius:4px; border:1px solid var(--line); background:transparent; color:var(--fg); cursor:pointer; }
+  button.approve { border-color:var(--ok); color:var(--ok); }
+  button.reject { border-color:var(--bad); color:var(--bad); }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<header><b>ARGUS</b>
+<nav><a href="/">Runs</a><a href="/approvals">Approvals</a><a href="/health">Model health</a></nav>
+<span class="muted">local only &middot; nothing leaves this machine without an approval</span></header>
+<main>{% block body %}{% endblock %}</main>
+</body>
+</html>

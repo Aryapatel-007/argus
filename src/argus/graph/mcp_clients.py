@@ -40,10 +40,18 @@ class ToolCallError(RuntimeError):
         super().__init__(f"{tool}: {text}")
 
 
+#: What a child server needs, and nothing else (Phase F review L7).
+_ENV_KEEP = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "COMSPEC", "TEMP", "TMP",
+             "USERPROFILE", "HOME", "LOCALAPPDATA", "APPDATA", "PROGRAMDATA", "NUMBER_OF_PROCESSORS",
+             "PROCESSOR_ARCHITECTURE", "PYTHONPATH", "PYTHONIOENCODING", "VIRTUAL_ENV", "OLLAMA_HOST"}
+
+
 def _server_env() -> Dict[str, str]:
-    # Inherit the environment: PYTHONPATH (tests, mutation runs), SystemRoot
-    # (Windows needs it to start Python), ARGUS_* switches.
-    return dict(os.environ)
+    """An allowlisted environment: Windows basics (SystemRoot is required to
+    start Python), PYTHONPATH (mutation runs point it at a mutated copy),
+    ARGUS_* switches and PLAYWRIGHT_* (browser location)."""
+    return {k: v for k, v in os.environ.items()
+            if k.upper() in _ENV_KEEP or k.upper().startswith(("ARGUS_", "PLAYWRIGHT_"))}
 
 
 class _StdioTool:
@@ -108,7 +116,8 @@ class McpBrowser(_StdioTool):
         super().__init__("argus.servers.browser", list(extra_args or []))
 
     async def open_page(self, url: str) -> Dict[str, Any]:
-        await self.open()
+        # The owner must open() first, in the task that will close() it
+        # (anyio cancel scopes are task-bound). No lazy open here.
         return await self.call("open_page", {"url": url})
 
 

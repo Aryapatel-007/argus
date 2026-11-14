@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %} &middot; {{ trace.run_id }}{% endblock %}
+{% block body %}
+<h2>Run <span class="mono">{{ trace.run_id }}</span></h2>
+{% if digest %}<div class="card"><b>Digest</b><br>{{ digest }}</div>
+{% else %}<div class="card muted">No digest: nothing changed, or the run has not finished.</div>{% endif %}
+{% for g in trace.graphs %}
+<h3>Graph <span class="mono">{{ g.graph_id }}</span> &middot; <span class="s-{{ g.status }}">{{ g.status }}</span>
+&middot; {{ g.swaps }} model swap{{ "s" if g.swaps != 1 }} &middot; {{ g.tokens_used }} tokens &middot; {{ "%.1f"|format(g.seconds_used) }}s</h3>
+<p class="muted">Model order: {{ g.model_sequence|join(" → ") if g.model_sequence else "none" }}</p>
+<div class="scroll"><table>
+<tr><th>Span</th><th>Status</th><th>Try</th><th>Model / strategy</th><th>Duration</th><th>Calls</th><th>Detail</th></tr>
+{% for s in g.spans %}
+<tr><td>{{ s.type }}<br><span class="mono muted">{{ s.node_id }}</span></td>
+<td class="s-{{ s.status }}">{{ s.status }}</td><td>{{ s.attempt }}</td>
+<td>{% if s.model %}<a href="/nodes/{{ s.node_id }}">{{ s.model }}</a><br><span class="muted">{{ s.strategy }}</span>{% else %}<span class="muted">tool</span>{% endif %}</td>
+<td>{{ "%.2fs"|format(s.duration_s) if s.duration_s is not none else "-" }}</td>
+<td>{{ s.calls.n or 0 }}{% if s.calls.failed %} <span class="s-failed">({{ s.calls.failed }} bad)</span>{% endif %}</td>
+<td>{{ s.error or s.skip_reason or "" }}</td></tr>
+{% endfor %}
+</table></div>
+{% endfor %}
+{% endblock %}

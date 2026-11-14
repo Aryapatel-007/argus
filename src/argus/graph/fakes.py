@@ -83,7 +83,8 @@ def _fence(text: str, marker: str) -> str:
 
 
 def _sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    # Line breaks end a sentence too (page text has one block per line).
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
 
 
 class FakeBackend:

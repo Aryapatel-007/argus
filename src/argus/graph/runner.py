@@ -26,12 +26,9 @@ from typing import Any, Dict, Optional
 
 from argus import config
 from argus.graph import fakes
-from argus.graph.engine import Engine
-from argus.graph.llm import OllamaBackend
-from argus.graph.mcp_clients import McpBrowser, RunMemory
-from argus.graph.services import ActionExecutor, Services, StaticBrowser
+from argus import app
+from argus.graph.services import ActionExecutor
 from argus.storage import db, lease
-from argus.storage.migrate import apply_migrations
 
 EXIT = {"done": 0, "failed": 1, "waiting_approval": 4}
 
@@ -54,28 +51,6 @@ class _HangingExecutor(ActionExecutor):
         if self.when == "after_effect":
             time.sleep(3600)
         return result
-
-
-def build_services(args, db_path: Path):
-    if args.fake_backend:
-        backend = fakes.FakeBackend(delay_s=args.delay)
-        if args.hang:
-            role, index = args.hang.split(":")
-            backend.hang_on = (role, int(index))
-    else:
-        backend = OllamaBackend()
-    if args.fake_embed:
-        fakes.install_fake_embeddings()
-        # Inherited by the spawned memory server (mcp_clients passes the env).
-        os.environ["ARGUS_FAKE_EMBED"] = "1"
-    if args.pages:
-        browser = StaticBrowser(json.loads(Path(args.pages).read_text(encoding="utf-8")))
-    else:
-        browser = McpBrowser()
-    memory = RunMemory(db_path, mode=args.memory, hang_after=args.hang_remember_after)
-    outbox = Path(args.outbox) if args.outbox else db_path.parent / "outbox"
-    actions = _HangingExecutor(outbox, args.hang_execute) if args.hang_execute else ActionExecutor(outbox)
-    return Services(backend=backend, memory=memory, browser=browser, actions=actions), memory
 
 
 def _target(args) -> Dict[str, Any]:
@@ -110,27 +85,27 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     db_path = Path(args.db)
-    apply_migrations(db_path)
-    services, memory = build_services(args, db_path)
-    engine = Engine(db_path, services, mode=args.mode, models=args.models)
+    backend = None
+    if args.fake_backend:
+        backend = fakes.FakeBackend(delay_s=args.delay)
+        if args.hang:
+            role, index = args.hang.split(":")
+            backend.hang_on = (role, int(index))
+    outbox = Path(args.outbox) if args.outbox else db_path.parent / "outbox"
+    opts = app.Options(
+        db_path=db_path, mode=args.mode, models=args.models, memory=args.memory,
+        pages=json.loads(Path(args.pages).read_text(encoding="utf-8")) if args.pages else None,
+        fake_embed=args.fake_embed, outbox=outbox, backend=backend,
+        actions=_HangingExecutor(outbox, args.hang_execute) if args.hang_execute else None,
+        hang_remember_after=args.hang_remember_after,
+    )
 
     async def go():
-        try:
+        async with app.Session(opts) as session:
             if args.resume:
-                # A resumed run always gets a FRESH memory server (ARGUS_BUILD 7.1).
-                await memory.open(args.resume)
-                outs = await engine.resume_run(args.resume)
+                outs = await session.resume(args.resume)
                 return outs[-1] if outs else None
-            # The runs row is committed by start_run BEFORE the server spawns:
-            # the memory server refuses a --run-id that does not exist.
-            run_id, graph_id = engine.start_run(_target(args), run_id=args.run_id)
-            await memory.open(run_id)
-            print(f"run_id: {run_id}", flush=True)
-            return await engine.run_graph(graph_id)
-        finally:
-            await memory.close()
-            if isinstance(services.browser, McpBrowser):
-                await services.browser.close()
+            return await session.run_target(_target(args), run_id=args.run_id)
 
     try:
         out = asyncio.run(go())

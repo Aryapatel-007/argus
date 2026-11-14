@@ -307,3 +307,27 @@ pass against the new engine.
 mimicking PLAN/ACT/OBSERVE would add a second orchestration path to keep
 correct. `scripts/crash_test.py` still runs against the loop it was written
 for.
+
+## D-025 — Eval pages go through an in-process HTML browser by default
+
+**Chose:** the evaluation harness serves scenario HTML through
+`eval.harness.HtmlBrowser` (stdlib HTML parser, same output shape as the
+browser MCP server); `--real-browser`-style runs through the fixture site,
+the browser server and Chromium remain available and are covered by their
+own end-to-end kill test.
+**Rejected:** Chromium for every eval run.
+**Why:** Phase G compares routing modes. Chromium adds seconds of variance
+per page that has nothing to do with the models being compared, and the
+browser path is already proven separately.
+
+## D-026 — Unchanged means "still stated", not "words still present"
+
+**Chose:** a stored fact is unchanged only if it still appears verbatim on
+the page (whitespace, case and thousands separators folded) or the new
+extraction is identical to it. Refines D-016.
+**Rejected:** the 85% word-overlap rule.
+**Why:** found by the eval harness on its first run: "Intakes: February and
+July" kept every word on a page that now says "February, July and
+November", so a real change was reported as unchanged. Overlap tests miss
+lists that grow. The cost: a page that only rewords a fact now reports it as
+modified (scenario s08 measures how often).

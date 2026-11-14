@@ -39,3 +39,30 @@ Raw rows: `model_profiles`, `co_residency` in data/argus.db.
    setting (over 1000 reasoning tokens for one sentence), and every call uses
    `think=False`. The metric is kept but should be read as "levels behave
    differently in output", not "low is cheap".
+
+## Co-residency re-measured with Chromium running (Phase F step 3, 2026-11-14)
+
+`python scripts/profile_models.py --coresidency-only --with-browser`, both
+load orders per pair, headless Chromium open with a large page. Log:
+`data/coresidency-browser.log`.
+
+| pair | A then B | B then A | co-resident |
+|---|---|---|---|
+| qwen3.5:9b + nomic-embed-text | qwen then nomic: yes | nomic then qwen: no | no |
+| llama3.1 + nomic-embed-text | yes | yes | **yes** |
+| phi4-mini + nomic-embed-text | yes | yes | **yes** |
+| gemma4:e4b + nomic-embed-text | gemma then nomic: yes | nomic then gemma: no | no |
+| gemma4:e4b + phi4-mini | gemma then phi4: yes | phi4 then gemma: no | no (was yes without the browser) |
+| every other chat pair | no | no | no |
+
+Reading it:
+- With a browser running, the only pairs safe in both orders are a small or
+  mid chat model plus the embedder. gemma4 + phi4-mini lost its co-residency
+  once Chromium took its share of memory: the browser does change the
+  answer, which is why the directive asked for this re-measurement.
+- qwen3.5:9b + nomic is order-dependent exactly as found before: an embed
+  after qwen is free, qwen after an embed evicts nomic. The memory server
+  embeds during `recall`/`remember`, which run on the I/O lane between GPU
+  calls, so a qwen-heavy run pays a small nomic reload (~0.3GB) now and then.
+- The router reads `co_residency` (both-orders rule), so these numbers are
+  what it now uses.
