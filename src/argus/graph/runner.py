@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -27,39 +28,12 @@ from argus import config
 from argus.graph import fakes
 from argus.graph.engine import Engine
 from argus.graph.llm import OllamaBackend
-from argus.graph.services import ActionExecutor, DirectMemory, Services, StaticBrowser
+from argus.graph.mcp_clients import McpBrowser, RunMemory
+from argus.graph.services import ActionExecutor, Services, StaticBrowser
 from argus.storage import db, lease
 from argus.storage.migrate import apply_migrations
 
 EXIT = {"done": 0, "failed": 1, "waiting_approval": 4}
-
-
-class _RunMemory:
-    """DirectMemory bound to the run id once it is known."""
-
-    def __init__(self, db_path: Path, hang_after: Optional[int] = None):
-        self.db_path = db_path
-        self.inner: Optional[DirectMemory] = None
-        #: crash tests: hang AFTER the Nth remember has committed but before
-        #: it returns, i.e. exactly the audit-H3 window
-        self.hang_after = hang_after
-        self.remembered = 0
-
-    def bind(self, run_id: str) -> None:
-        self.inner = DirectMemory(self.db_path, run_id)
-
-    async def list_current_facts(self, target_id):
-        return await self.inner.list_current_facts(target_id)
-
-    async def recall(self, query, target_id, limit=5):
-        return await self.inner.recall(query, target_id, limit)
-
-    async def remember(self, **kw):
-        result = await self.inner.remember(**kw)
-        self.remembered += 1
-        if self.hang_after is not None and self.remembered >= self.hang_after:
-            await asyncio.sleep(3600)
-        return result
 
 
 class _HangingExecutor(ActionExecutor):
@@ -92,13 +66,13 @@ def build_services(args, db_path: Path):
         backend = OllamaBackend()
     if args.fake_embed:
         fakes.install_fake_embeddings()
+        # Inherited by the spawned memory server (mcp_clients passes the env).
+        os.environ["ARGUS_FAKE_EMBED"] = "1"
     if args.pages:
         browser = StaticBrowser(json.loads(Path(args.pages).read_text(encoding="utf-8")))
     else:
-        from argus.graph.mcp_clients import McpBrowser  # Phase F
-
         browser = McpBrowser()
-    memory = _RunMemory(db_path, hang_after=args.hang_remember_after)
+    memory = RunMemory(db_path, mode=args.memory, hang_after=args.hang_remember_after)
     outbox = Path(args.outbox) if args.outbox else db_path.parent / "outbox"
     actions = _HangingExecutor(outbox, args.hang_execute) if args.hang_execute else ActionExecutor(outbox)
     return Services(backend=backend, memory=memory, browser=browser, actions=actions), memory
@@ -131,6 +105,8 @@ def main(argv=None) -> int:
     ap.add_argument("--hang-remember-after", type=int)
     ap.add_argument("--hang-execute", choices=["after_claim", "after_effect"])
     ap.add_argument("--run-id")
+    ap.add_argument("--memory", default="mcp", choices=["mcp", "direct"],
+                    help="mcp: memory server over stdio (production); direct: in-process (tests)")
     args = ap.parse_args(argv)
 
     db_path = Path(args.db)
@@ -139,14 +115,22 @@ def main(argv=None) -> int:
     engine = Engine(db_path, services, mode=args.mode, models=args.models)
 
     async def go():
-        if args.resume:
-            memory.bind(args.resume)
-            outs = await engine.resume_run(args.resume)
-            return outs[-1] if outs else None
-        run_id, graph_id = engine.start_run(_target(args), run_id=args.run_id)
-        memory.bind(run_id)
-        print(f"run_id: {run_id}", flush=True)
-        return await engine.run_graph(graph_id)
+        try:
+            if args.resume:
+                # A resumed run always gets a FRESH memory server (ARGUS_BUILD 7.1).
+                await memory.open(args.resume)
+                outs = await engine.resume_run(args.resume)
+                return outs[-1] if outs else None
+            # The runs row is committed by start_run BEFORE the server spawns:
+            # the memory server refuses a --run-id that does not exist.
+            run_id, graph_id = engine.start_run(_target(args), run_id=args.run_id)
+            await memory.open(run_id)
+            print(f"run_id: {run_id}", flush=True)
+            return await engine.run_graph(graph_id)
+        finally:
+            await memory.close()
+            if isinstance(services.browser, McpBrowser):
+                await services.browser.close()
 
     try:
         out = asyncio.run(go())

@@ -33,9 +33,15 @@ def _succeeded(members: List[Any]) -> bool:
     chains: Dict[str, List[Any]] = defaultdict(list)
     for n in members:
         chains[n.retry_root].append(n)
-    return all(any(m.status in ("done", "skipped") for m in chain) and
-               not all(m.status == "failed" for m in chain)
-               for chain in chains.values())
+    def chain_ok(chain):
+        if any(m.status == "done" for m in chain):
+            return True
+        # Skipped by design (nothing to send, a human said no) is neutral.
+        # Skipped because something upstream failed, or a failure followed by a
+        # budget skip, is NOT a success (delta review 11).
+        return all(m.status == "skipped" and not str(m.skip_reason or "").startswith("upstream")
+                   for m in chain)
+    return all(chain_ok(c) for c in chains.values())
 
 
 def record_graph(store: Any, graph_id: str) -> None:

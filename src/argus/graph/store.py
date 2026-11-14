@@ -234,6 +234,7 @@ class GraphStore:
         counts_toward_limit: bool = True,
         allow_existing_dst: bool = False,
         complete_node: Optional[Tuple[str, Dict[str, Any]]] = None,
+        extra_ops: Sequence[Op] = (),
     ) -> Tuple[bool, List[validator.Violation]]:
         """Validate, then store the expansion and its nodes in ONE transaction.
 
@@ -289,6 +290,8 @@ class GraphStore:
                                  output={**output, "expansion_id": expansion_id,
                                          "expansion_accepted": accepted,
                                          "violations": [str(v) for v in violations]})
+                for sql, params in extra_ops:  # e.g. the planner's rewards
+                    self.conn.execute(sql, params)
             if not accepted:
                 return False, violations
             for n in expansion.nodes.values():

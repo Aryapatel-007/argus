@@ -220,10 +220,10 @@ nothing. Calling that free would make the router pick it too eagerly.
 **Chose:** (1) the validator rejects any graph where an execute_action is
 reachable without crossing an approval_gate; (2) readiness never readies an
 execute_action until every gate ancestor is `done`, and fails closed when it
-finds none; (3) the executor re-reads the approvals row and acts only on
-`approved`, flips it to `executed` conditionally on `approved` in the same
-transaction as the node's done, and the effect itself (outbox file named by
-the idempotency key) is idempotent.
+finds none; (3) the executor claims the approvals row (approved -> executed,
+claimed_by this node, in one transaction) and acts only after that claim;
+the effect itself (outbox file named by the idempotency key) is idempotent
+(D-023 has the claim protocol).
 **Rejected:** any single one of these.
 **Why:** hard constraint 4 must survive a bug in any one layer; each layer
 has its own test and mutant.
@@ -279,7 +279,17 @@ review M10); adding an `executing` status (needs a table rebuild of
 approvals for no extra safety).
 **Why:** once claimed, nobody can change the decision under the action, and
 every crash point (after claim, after effect) resumes to exactly one effect.
-Proven by real-kill crash tests for both windows.
+Proven by real-kill crash tests for both windows. If the action itself raises
+after the claim, the row becomes `failed` (nothing was sent: the executor
+writes atomically), so the table never says an action happened when it did
+not.
+
+Migration 002's comment says approved and executed are "deliberately
+SEPARATE" because approved-but-not-executed is the crash window. That window
+still exists and is still recoverable; it is now marked by the claim
+(`status = executed`, `result.state = "claimed"`) instead of by
+`status = approved`. `result.state` moves claimed -> done or -> failed. A
+reader of the table must treat `executed` + `state: claimed` as "in flight".
 
 ## D-024 — Step 12: the graph engine carries the legacy loop's guarantees; the loop stays as a reference
 

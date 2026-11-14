@@ -137,7 +137,7 @@ class Engine:
 
     # -------------------------------------------------------------- run
 
-    async def run_graph(self, graph_id: str) -> RunOutcome:
+    async def run_graph(self, graph_id: str, *, release: bool = True) -> RunOutcome:
         with db.connect(self.db_path) as conn:
             base = GraphStore(conn)
             g = base.graph(graph_id)
@@ -146,7 +146,13 @@ class Engine:
             if not lease.acquire(conn, g.run_id, self.owner):
                 raise lease.LeaseLost(f"run {g.run_id} is owned by a live process")
             store = GraphStore(conn, run_id=g.run_id, lease_owner=self.owner)
-            return await self._drive(store, g)
+            try:
+                return await self._drive(store, g)
+            finally:
+                # Every exit, including an exception, frees the run so another
+                # engine in this same live process can resume it (delta review 6).
+                if release:
+                    lease.release(conn, g.run_id, self.owner)
 
     async def resume_run(self, run_id: str) -> List[RunOutcome]:
         """Take over a run (lease) and drive every unfinished graph of it."""
@@ -157,8 +163,14 @@ class Engine:
             ids = [r["graph_id"] for r in conn.execute(
                 "SELECT graph_id FROM graphs WHERE run_id = ? AND status IN ('running', 'waiting_approval') "
                 "ORDER BY created_at", (run_id,))]
-        for gid in ids:
-            outcomes.append(await self.run_graph(gid))
+        try:
+            for gid in ids:
+                # Hold the lease ACROSS graphs: releasing between them would let
+                # another process take the run mid-resume (delta review 7).
+                outcomes.append(await self.run_graph(gid, release=False))
+        finally:
+            with db.connect(self.db_path) as conn:
+                lease.release(conn, run_id, self.owner)
         return outcomes
 
     async def _drive(self, store: GraphStore, g) -> RunOutcome:
@@ -230,11 +242,7 @@ class Engine:
                     # at waiting_approval would freeze notify as failed.
                     self._record_templates(store, g.graph_id)
                 store.finish_graph(g.graph_id, outcome)
-                result = self._outcome(store, g, outcome)
-                # Nobody drives a finished or waiting graph: free the run so a
-                # later engine (same process or not) can resume it (review M3).
-                lease.release(store.conn, g.run_id, self.owner)
-                return result
+                return self._outcome(store, g, outcome)
 
             done, _ = await asyncio.wait(list(tasks), return_when=asyncio.FIRST_COMPLETED)
             for t in done:
@@ -435,16 +443,15 @@ class Engine:
         reward_ops = self._reward_ops(store, node, r)
         notes = {"notes": r.notes} if r.notes else None
         if node.node_type in ("plan", "replan") and r.status == "done":
-            self._apply_plan(store, g, target, node, r.output or {})
-            self._apply_ops(store, reward_ops)
+            self._apply_plan(store, g, target, node, r.output or {}, extra_ops=reward_ops)
         elif node.node_type == "plan" and r.status == "failed":
             # The planner never sinks a run: fall back to the target's own
             # page and fields (deterministic), and say so in the output.
             fallback = {"thought": "planner failed; deterministic fallback",
                         "steps": [{"template": "check_page",
                                    "params": {"url": target.get("url"), "fields": list(target.get("extract") or [])}}]}
-            self._apply_plan(store, g, target, node, {"plan": fallback, "fallback": True, "planner_error": r.error})
-            self._apply_ops(store, reward_ops)
+            self._apply_plan(store, g, target, node, {"plan": fallback, "fallback": True,
+                                                      "planner_error": r.error}, extra_ops=reward_ops)
         elif node.node_type == "replan" and r.status == "failed":
             store.transition(node_id, "done", expect=("running",), extra_ops=reward_ops,
                              output={"plan": {"thought": "replan failed", "steps": []}, "error": r.error})
@@ -472,6 +479,8 @@ class Engine:
         from argus.graph import registry
 
         v = registry.profile(store.conn, model, node_type, "quality")
+        if v is None:
+            v = registry.profile(store.conn, model, "*", "quality")  # same fallback as the router
         return float(v if v is not None else self.cfg.get("defaults", {}).get("quality", 0.5))
 
     def _reward_ops(self, store, node, r) -> list:
@@ -504,7 +513,7 @@ class Engine:
                             prior_quality=self._prior(store, author, subj.node_type), strength=strength)
         return ops
 
-    def _apply_plan(self, store, g, target, node, output) -> None:
+    def _apply_plan(self, store, g, target, node, output, extra_ops=()) -> None:
         plan = output.get("plan") or {}
         nodes, edges = store.nodes(g.graph_id), store.edges(g.graph_id)
         spec = GraphSpec()
@@ -568,7 +577,7 @@ class Engine:
         store.apply_expansion(
             g.graph_id, spec, kind=node.node_type, requested_by=node.node_id,
             expansion_id=f"exp-{node.node_id}", counts_toward_limit=counts,
-            complete_node=(node.node_id, out))
+            complete_node=(node.node_id, out), extra_ops=extra_ops)
 
     def _record_templates(self, store, graph_id) -> None:
         from argus.graph import procedural

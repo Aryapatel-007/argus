@@ -178,11 +178,13 @@ class Router:
                     chosen = greedy
         state.decisions += 1
         state.explorations += int(explore)
-        if chosen.get("health") == "trial":
-            self.health.grant_trial(chosen["model"])  # its ONE half-open call
 
         strategy, models = self._strategy(node_type, difficulty, attempt, has_reflection,
                                           default_strategy, chosen, usable)
+        by_model = {c["model"]: c for c in cands}
+        for m in models:  # every model this decision may call, not only the first
+            if by_model.get(m, {}).get("health") == "trial":
+                self.health.grant_trial(m)  # its ONE half-open call
         reason = (f"{chosen['model']} utility {chosen['utility']:.3f} "
                   f"(q {chosen['quality']:.2f}, lat {chosen['latency_s']:.1f}s, swap {chosen['swap_s']:.1f}s, "
                   f"risk {chosen['risk']:.2f})" + (" [explore]" if explore else "") + independence_note)

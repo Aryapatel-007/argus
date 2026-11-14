@@ -5,11 +5,10 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** E done pending merge -> next F (rest of the product)
-- **Branch:** `wip/phase-e` holds Phase E steps 4-12 + review fixes. Merge to
-  main after the delta review approves (see "Next steps").
-- **Test count:** 342 passing on wip/phase-e (main: 270). Never drops.
-- **Mutation check:** 17/17 killed. **Security scan:** 0 blocking.
+- **Phase:** E done and merged to main. F in progress (steps 1-2 done).
+- **Branch:** main (`wip/phase-e` merged; kept, not deleted).
+- **Test count:** 368 passing. Never drops.
+- **Mutation check:** 20/20 killed. **Security scan:** 0 blocking.
 - **Blocked:** no
 
 ## Phase log
@@ -43,22 +42,20 @@ then ARGUS_BUILD.md.
   - Tests: engine end to end, router/bandit/health, expansion + procedural,
     review fixes, and REAL-KILL crash tests (`tests/test_graph_crash.py`):
     7 in-call kill points + 2 execute windows + live-lease refusal.
-  - Two reviewer passes. First found 2 high + 8 medium; all fixed
-    (`tests/test_graph_review_fixes.py`). Decisions D-016 to D-024.
+  - Two reviewer passes. First: 2 high + 8 medium, all fixed
+    (`tests/test_graph_review_fixes.py`). Delta review of those fixes: 1 high
+    (a malformed port crashed the engine on every resume) + 3 medium, all
+    fixed (`tests/test_graph_delta_fixes.py`). Decisions D-016 to D-024.
+- **F** step 1: `graph/mcp_clients.py` (McpMemory/McpBrowser over stdio,
+  RunMemory owns the per-run spawn; runner defaults to `--memory mcp`).
+  Step 2: every graph crash test now runs the memory server as a real MCP
+  subprocess, including the kill right after `remember` committed, and
+  asserts by process listing that the server dies with its killed parent
+  (Windows Job Object verified, not assumed).
 
 ## Next steps
 
-1. When the delta review of the review fixes lands: fix anything it finds,
-   rerun the suite + `scripts/mutation_check.py` + `scripts/security_scan.py`,
-   then merge `wip/phase-e` into main (fast-forward or merge commit, no
-   force push), push, delete nothing.
-2. Phase F (ARGUS_BUILD.md section 7), in order:
-   1. `graph/mcp_clients.py`: McpMemory over stdio (spawn
-      `python -m argus.servers.memory --db-path --run-id` after the runs
-      row commits; fresh spawn on resume; clean shutdown).
-   2. Crash-resume across that boundary: kill while `remember` is in
-      flight; verify no orphan by process listing (MCP v2 stdio client uses
-      a Windows Job Object; verify, do not assume).
+1. Phase F (ARGUS_BUILD.md section 7), remaining:
    3. Browser MCP server (`servers/browser.py`, raw Playwright, D-002):
       `open_page` returns text + links + confidence, degrades instead of
       raising, per-domain throttle, real wait conditions, closes contexts.
@@ -71,7 +68,7 @@ then ARGUS_BUILD.md.
       model, calibration against a hand-labelled set.
    8. APScheduler + hard-kill test + reflect (consolidation) schedule.
    9. One-command start, README, demo script. Security scan again.
-3. Phase G: baseline vs fixed vs learning on identical scenarios ->
+2. Phase G: baseline vs fixed vs learning on identical scenarios ->
    `notes/routing-results.md`.
 
 ## Backlog (medium/low)

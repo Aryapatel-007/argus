@@ -152,11 +152,18 @@ def test_kill_mid_call_then_resume_matches_a_run_that_never_crashed(tmp_path, co
         "SELECT node_id, decision_id FROM routing_decisions WHERE frozen = 1 AND superseded = 0")}
     samples_before = case.q("SELECT node_id, sample_index, output FROM node_samples")
 
+    if sys.platform == "win32":
+        assert children, "positive control: the memory MCP server must be a child process"
     proc.kill()
     proc.wait(timeout=30)
     assert proc.poll() is not None
-    for child in children:
-        assert not _children_of(child) and child not in _children_of(os.getppid()), "orphan left behind"
+    # Windows does not kill children with their parent. Verify by process
+    # listing that the MCP server died with it (Job Object), never assume.
+    from argus.storage.lease import pid_alive
+    deadline = time.time() + 15
+    while time.time() < deadline and any(pid_alive(c) for c in children):
+        time.sleep(0.2)
+    assert not [c for c in children if pid_alive(c)], "orphaned server process after a hard kill"
 
     case.finish()
 

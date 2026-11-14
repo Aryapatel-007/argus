@@ -1,7 +1,8 @@
 """Node handlers: what each node type does when it runs.
 
-A handler never writes graph state. It returns a NodeResult; the engine
-stores it (status, output, event, extra ops) in one transaction. Handlers
+A handler returns a NodeResult; the engine stores it (status, output,
+event, extra ops) in one transaction. One exception: execute_action CLAIMS
+its approval row in its own lease-guarded transaction before acting (D-023). Handlers
 never raise to the engine for an expected failure: a failed page, an invalid
 model answer or a rejected critique is a NodeResult with status 'failed', so
 one bad page degrades a run instead of killing it.
@@ -10,10 +11,9 @@ Side effects:
   - approval_gate writes ONE approvals row (UNIQUE idempotency key, stored
     with the node before it ran) via extra_ops, in the same transaction as
     the gate's running -> blocked.
-  - execute_action re-reads that row and acts only if it says 'approved'
-    (third, independent check after the validator and readiness). The effect
-    is idempotent by key; the status flip to 'executed' is conditional on
-    'approved' and lands in the same transaction as the node's done.
+  - execute_action claims the row (approved -> executed, claimed_by this
+    node) BEFORE acting, acts idempotently by key, then records the result
+    with the node's done; a failed action flips the row to 'failed' (D-023).
 """
 
 from __future__ import annotations
@@ -69,9 +69,9 @@ async def run(ex: Any) -> NodeResult:
 
 def _validator_rewards(node_type: str, res) -> List[Tuple[str, str, str, float, str]]:
     out = []
+    # Reused samples are rewarded too: keys are per sample and idempotent, and
+    # skipping them lost the signal from exactly the calls a crash interrupted.
     for a in res.attempts:
-        if a.reused:
-            continue
         out.append((node_type, a.model, "validator", 1.0 if a.valid else 0.0,
                     "; ".join(a.problems)[:300] if a.problems else "valid", f"#{a.index}"))
     return out
@@ -254,13 +254,21 @@ def same_site(url: str, base: str) -> bool:
     url "same site")."""
     if not url or not base:
         return False
-    a, b = urlparse(url), urlparse(base)
-    ha, hb = (a.hostname or "").lower(), (b.hostname or "").lower()
+    try:
+        a, b = urlparse(url), urlparse(base)
+        ha, hb = (a.hostname or "").lower(), (b.hostname or "").lower()
+        # .port raises ValueError on ":bad" or ":99999". A page or a planner
+        # can produce such a url; it must be refused, never crash the engine
+        # (delta review High 1: the crash repeated on every resume).
+        pa, pb = a.port, b.port
+    except ValueError:
+        return False
     strip = lambda h: h[4:] if h.startswith("www.") else h  # noqa: E731
-    default = {"http": 80, "https": 443}
-    pa = a.port or default.get(a.scheme)
-    pb = b.port or default.get(b.scheme)
-    return a.scheme in ("http", "https") and bool(ha) and strip(ha) == strip(hb) and pa == pb
+    if a.scheme not in ("http", "https") or not ha or strip(ha) != strip(hb):
+        return False
+    # An explicit port must match; default ports (http 80 / https 443) are
+    # treated as the same site so mixed-scheme links still work.
+    return pa is None and pb is None or pa == pb
 
 
 async def _fetch(ex: Any) -> NodeResult:
@@ -282,7 +290,10 @@ async def _search(ex: Any) -> NodeResult:
     keywords = [k.lower() for k in ex.params.get("keywords") or []]
     best, best_score = None, 0
     for link in page.get("links", []):
-        href = urljoin(page.get("final_url") or page.get("url") or "", link.get("href", ""))
+        try:
+            href = urljoin(page.get("final_url") or page.get("url") or "", link.get("href", ""))
+        except ValueError:
+            continue  # one malformed link must not fail the search
         if not same_site(href, ex.target.get("url", "")):
             continue
         hay = f"{link.get('text', '')} {href}".lower()
@@ -350,7 +361,13 @@ async def _execute(ex: Any) -> NodeResult:
     try:
         result = ex.services.actions.execute(row["action_kind"], payload, key)
     except Exception as exc:  # noqa: BLE001
-        return NodeResult("failed", error=f"action failed after claim: {exc!r}")
+        # The executor writes atomically (os.replace), so an exception means
+        # nothing was sent. Say so in the row: a claimed-but-unsent action must
+        # never read as executed (delta review M2).
+        fail = ("UPDATE approvals SET status = 'failed', result = ? "
+                "WHERE idempotency_key = ? AND status = 'executed'",
+                (json.dumps({"claimed_by": me, "state": "failed", "error": repr(exc)[:500]}), key))
+        return NodeResult("failed", error=f"action failed after claim: {exc!r}", extra_ops=[fail])
     op = (
         "UPDATE approvals SET result = ? WHERE idempotency_key = ? AND status = 'executed'",
         (json.dumps({"claimed_by": me, "state": "done", **result}, sort_keys=True), key),

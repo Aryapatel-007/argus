@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -1036,6 +1037,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
+    if os.environ.get("ARGUS_FAKE_EMBED") == "1":
+        # Tests and offline crash runs only: deterministic vectors, no Ollama.
+        # It can only make embeddings fake, never send anything anywhere.
+        from argus.graph.fakes import install_fake_embeddings
+
+        install_fake_embeddings()
+        log("ARGUS_FAKE_EMBED=1: using deterministic fake embeddings")
     # Order matters: schema first, then the run. Checking the run against a
     # database with no `runs` table would raise OperationalError instead of
     # the clear migration message assert_migrated exists to give.
