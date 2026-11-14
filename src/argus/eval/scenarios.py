@@ -54,6 +54,8 @@ class Scenario:
     silent: Optional[bool] = None
     forbidden: List[str] = field(default_factory=list)
     category: str = "change"
+    #: the last run is EXPECTED to fail (e.g. the site returns HTTP 500)
+    last_run_may_fail: bool = False
 
 
 def _two(v1: str, v2: str, path: str = "/p") -> List[Dict[str, Any]]:
@@ -87,8 +89,9 @@ SCENARIOS: List[Scenario] = [
              kinds={"fees": "added"}, digest_has=["45,000"], silent=False),
     Scenario("s08_reworded", "Same facts, new wording and layout.",
              _two(program(), program(fee_sentence="Tuition (2027 intake): AUD 45,000 per year.")),
-             facts={"fees": ["45,000"]}, digest_has=[], forbidden=[], kinds={"duration": "unchanged"},
-             category="silence"),
+             # Nothing changed in VALUE: a fee re-worded is not news (review M-A).
+             facts={"fees": ["45,000"]}, kinds={"fees": "unchanged", "duration": "unchanged"},
+             silent=True, category="silence"),
     Scenario("s09_noise", "Unrelated news with numbers is added; fields unchanged.",
              _two(program(), program(extra="<p>Our 2026 open day had 3,200 visitors and 14 talks.</p>")),
              facts={"fees": ["45,000"]}, kinds={"fees": "unchanged"}, silent=True,
@@ -145,7 +148,8 @@ SCENARIOS: List[Scenario] = [
              facts={"intake_dates": ["february"]}, kinds={"intake_dates": "modified"}, silent=False),
     Scenario("s24_server_error", "Second run: the site returns HTTP 500.",
              [{"/p": program()}, {"/p": (500, "<html><body>Internal error</body></html>")}],
-             facts={"fees": ["45,000"], "duration": ["2"]}, silent=True, forbidden=["removed"], category="structure"),
+             facts={"fees": ["45,000"], "duration": ["2"]}, silent=True, forbidden=["removed"], category="structure",
+             last_run_may_fail=True),
 ]
 
 

@@ -39,11 +39,12 @@ def test_recover_continues_past_a_failing_run(env, monkeypatch):
         return []
 
     monkeypatch.setattr(argus_app.Session, "resume", resume)
-    for _ in range(sched_mod.MAX_RECOVER_ATTEMPTS + 2):
+    s.clock = lambda: 1000.0  # frozen: the broken run stays inside its backoff
+    for _ in range(5):
         asyncio.run(s.recover())
     assert resumed[0] == "approved-run", "decided approvals go first"
-    assert s.failures["broken-run"] == sched_mod.MAX_RECOVER_ATTEMPTS, "parked after the cap"
-    assert len(resumed) == sched_mod.MAX_RECOVER_ATTEMPTS + 2
+    assert len(resumed) == 5, "the approved run is resumed on every tick despite the broken one"
+    assert s.failures["broken-run"][0] == 1, "the broken run waits out its backoff instead of every tick"
 
 
 # -- M1: a memory server that cannot start does not strand the lease -------

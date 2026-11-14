@@ -108,6 +108,11 @@ class Engine:
                     (run_id, target["id"]),
                 )
                 lease.insert_initial(conn, run_id, self.owner)
+        except BaseException:
+            if own:
+                cm.__exit__(None, None, None)
+            raise
+        try:
             store = GraphStore(conn, run_id=run_id, lease_owner=self.owner)
             limits = Limits.from_dict(self.cfg.get("limits"))
             budget = self.cfg.get("budget", {})
@@ -131,6 +136,17 @@ class Engine:
             if not ok:
                 raise RuntimeError(f"initial graph invalid: {violations}")
             return run_id, graph_id
+        except BaseException as exc:
+            # The runs row and its lease are already committed. Never leave a
+            # live process holding a run nobody will drive (delta review
+            # M-B): close the run as failed, then free it.
+            with db.atomic(conn):
+                conn.execute("UPDATE runs SET status = 'failed', error = ?, "
+                             "finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE run_id = ?",
+                             (f"start failed: {exc!r}"[:500], run_id))
+                conn.execute("UPDATE graphs SET status = 'failed' WHERE run_id = ?", (run_id,))
+            lease.release(conn, run_id, self.owner)
+            raise
         finally:
             if own:
                 cm.__exit__(None, None, None)

@@ -5,10 +5,10 @@ then ARGUS_BUILD.md.
 
 ## Where we are
 
-- **Phase:** G — STOPPED before a valid benchmark; fix delta-review findings first
+- **Phase:** G — benchmark RE-RUNNING on fixed code (delta findings fixed, see D-027/D-028)
 - **Branch:** main. Phases A-F merged (`wip/phase-e`, `wip/phase-f` kept).
-- **Test count:** 409 passing. Never drops.
-- **Mutation check:** 22/22 killed. **Security scan:** 0 blocking
+- **Test count:** 436 passing. Never drops.
+- **Mutation check:** 24/24 killed. **Security scan:** 0 blocking
   (`notes/security-audit-phase-f.md`).
 - **Blocked:** no
 

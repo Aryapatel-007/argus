@@ -48,17 +48,49 @@ def canon(text: str) -> str:
     return re.sub(r"(?<=\d),(?=\d{3}\b)", "", norm_space(text))
 
 
-def still_stated(stored: str, page_text: str, extracted: Optional[str] = None) -> bool:
-    """Is a stored fact still what the page says? (D-016, refined in Phase F.)
+def _canon_lines(text: str) -> str:
+    """canon() per line, keeping line breaks: a line end is a statement end."""
+    return "\n".join(canon(line) for line in (text or "").splitlines() if line.strip())
 
-    Verbatim presence (after canon) or an identical new extraction. Word
-    overlap alone is NOT enough: the eval harness found "Intakes: February
-    and July" passing an overlap test against "February, July and November"
-    (every old word still there, the meaning changed)."""
-    s = canon(stored)
-    if s and s.rstrip(".") in canon(page_text):
+
+#: What may follow a stated fact: end of text, end of line, or a sentence
+#: mark that is NOT the start of a decimal ("6." in "6.5" is not an end).
+_STATEMENT_END = r"(?=\s*(?:$|\n|[.;!?](?!\d)))"
+
+
+def still_stated(stored: str, page_text: str, extracted: Optional[str] = None) -> bool:
+    """Is a stored fact still what the page says? (D-016, D-026, D-027.)
+
+    True when the stored fact appears on the page AS A WHOLE STATEMENT: it
+    starts at a word boundary and ends at a sentence or line end. An
+    unanchored substring is not enough (delta review H-B): "IELTS overall 6"
+    sits inside "IELTS overall 6.5", "Places: 12" inside "Places: 120", and
+    "Intakes: February and July" inside "February and July, and November".
+
+    Also true when a numeric fact's new extraction carries exactly the same
+    numbers and nearly the same words both ways (mutual overlap >= 0.75):
+    the extractor re-phrased an unchanged value (review M-A). Facts without
+    numbers do not get this path, because a list that grows keeps its old
+    words (the s03 finding).
+    """
+    s = canon(stored).rstrip(" .;:,")
+    if len(s) < 3 or not re.search(r"[a-z0-9]", s):
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(s) + _STATEMENT_END
+    if re.search(pattern, _canon_lines(page_text)):
         return True
-    return extracted is not None and canon(extracted).rstrip(".") == s.rstrip(".")
+    if extracted is None:
+        return False
+    e = canon(extracted).rstrip(" .;:,")
+    if e == s:
+        return True
+    ns, ne = sorted(nt.numeric_tokens(s)), sorted(nt.numeric_tokens(e))
+    if not ns or ns != ne:
+        return False
+    ws, we = set(words(s)), set(words(e))
+    if not ws or not we:
+        return False
+    return len(ws & we) / len(ws) >= 0.75 and len(ws & we) / len(we) >= 0.75
 
 
 def supported(claim: str, evidence: str, min_overlap: float = 0.6) -> bool:

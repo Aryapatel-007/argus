@@ -23,8 +23,10 @@ Page = Union[str, Tuple[int, str]]
 
 class FixtureServer:
     def __init__(self, pages: Optional[Dict[str, Page]] = None, robots: str = "User-agent: *\nAllow: /\n",
-                 slow_paths: Optional[Dict[str, float]] = None):
+                 slow_paths: Optional[Dict[str, float]] = None, redirects: Optional[Dict[str, str]] = None):
         self.pages: Dict[str, Page] = dict(pages or {})
+        #: path -> absolute Location, answered with a real HTTP 302
+        self.redirects: Dict[str, str] = dict(redirects or {})
         self.robots = robots
         self.slow_paths = dict(slow_paths or {})
         self.hits: Dict[str, int] = defaultdict(int)
@@ -52,6 +54,12 @@ class FixtureServer:
                 owner.hit_times[path].append(time.monotonic())
                 if path == "/robots.txt":
                     return self._send(200, owner.robots, "text/plain")
+                if path in owner.redirects:
+                    self.send_response(302)
+                    self.send_header("Location", owner.redirects[path])
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return None
                 if path in owner.slow_paths:
                     time.sleep(owner.slow_paths[path])  # simulates a slow origin
                 page = owner.pages.get(path)

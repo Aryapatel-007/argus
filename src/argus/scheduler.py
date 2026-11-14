@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,8 @@ from argus.storage import db, lease
 PERIOD = {"daily": timedelta(days=1), "weekly": timedelta(days=7)}
 CRON = {"daily": {"hour": 7, "minute": 0}, "weekly": {"day_of_week": "mon", "hour": 7, "minute": 0}}
 MIN_NEW_FACTS_FOR_REFLECT = 2
-MAX_RECOVER_ATTEMPTS = 3
+RECOVER_BACKOFF_S = 600.0
+RECOVER_BACKOFF_MAX_S = 6 * 3600.0
 #: A laptop asleep at the scheduled minute still runs the job when it wakes.
 GRACE_S = 6 * 3600
 
@@ -78,7 +80,9 @@ class Scheduler:
         self.interval_s = interval_s  # tests: every target every N seconds
         self.lock = asyncio.Lock()
         self.sched = None
-        self.failures: Dict[str, int] = {}
+        #: run_id -> (consecutive failures, monotonic time of the next try)
+        self.failures: Dict[str, tuple] = {}
+        self.clock = time.monotonic
 
     async def watch(self, target: Dict[str, Any]) -> None:
         async with self.lock:
@@ -90,12 +94,16 @@ class Scheduler:
     async def recover(self) -> None:
         """Resume what a human decided FIRST (approved actions waiting), then
         what a hard kill left behind. One failing run never blocks the rest
-        (Phase F review H1), and a run that keeps failing is parked after
-        MAX_RECOVER_ATTEMPTS so it cannot cost a resume every tick forever."""
+        (Phase F review H1). A run that keeps failing is retried with
+        exponential backoff (10 min, doubling, at most 6 h), never parked for
+        good: Ollama down for half an hour after boot must not strand an
+        approved action until a restart (delta review M-C). Every failure is
+        written to runs.error, which the dashboard shows."""
         async with self.lock:
             db_path = Path(self.opts.db_path)
+            now = self.clock()
             runs = list(dict.fromkeys(app.decided_waiting_runs(db_path) + interrupted_runs(db_path)))
-            runs = [r for r in runs if self.failures.get(r, 0) < MAX_RECOVER_ATTEMPTS]
+            runs = [r for r in runs if self.failures.get(r, (0, 0.0))[1] <= now]
             if not runs:
                 return
             async with app.Session(self.opts) as s:
@@ -107,20 +115,20 @@ class Scheduler:
                     except lease.LeaseLost:
                         log(f"{run_id} is owned by a live process; left alone")
                     except Exception as exc:  # noqa: BLE001 - next run, not next tick
-                        self.failures[run_id] = self.failures.get(run_id, 0) + 1
-                        log(f"resume {run_id} failed ({self.failures[run_id]}/{MAX_RECOVER_ATTEMPTS}): {exc!r}")
+                        count = self.failures.get(run_id, (0, 0.0))[0] + 1
+                        delay = min(RECOVER_BACKOFF_S * 2 ** (count - 1), RECOVER_BACKOFF_MAX_S)
+                        self.failures[run_id] = (count, now + delay)
+                        msg = (f"recovery failed {count}x, next try in {delay / 60:.0f} min: {exc!r}")[:500]
+                        log(f"resume {run_id}: {msg}")
+                        with db.connect(db_path) as conn, db.atomic(conn):
+                            conn.execute("UPDATE runs SET error = ? WHERE run_id = ?", (msg, run_id))
 
     async def reflect(self, target: Dict[str, Any]) -> None:
         if new_facts_since_reflect(Path(self.opts.db_path), target["id"]) < MIN_NEW_FACTS_FOR_REFLECT:
             return
         async with self.lock:
             async with app.Session(self.opts) as s:
-                run_id, gid = s.engine.start_run(target, kind="reflect")
-                await s.memory.open(run_id)
-                try:
-                    out = await s.engine.run_graph(gid)
-                finally:
-                    await s.memory.close()
+                out = await s.run_reflect(target)
             log(f"reflect {target['id']}: {out.status}")
 
     def start(self) -> None:

@@ -88,13 +88,22 @@ class Session:
 
     async def run_target(self, target: Dict[str, Any], run_id: Optional[str] = None) -> RunOutcome:
         run_id, graph_id = self.engine.start_run(target, run_id=run_id)
+        return await self._drive_new(run_id, graph_id)
+
+    async def run_reflect(self, target: Dict[str, Any]) -> RunOutcome:
+        """Memory consolidation for one target (the scheduler's weekly policy)."""
+        run_id, graph_id = self.engine.start_run(target, kind="reflect")
+        return await self._drive_new(run_id, graph_id)
+
+    async def _drive_new(self, run_id: str, graph_id: str) -> RunOutcome:
         try:
             await self.memory.open(run_id)  # AFTER the runs row is committed
         except BaseException:
             # start_run took the run's lease for this live process. If the
             # memory server cannot start, nothing would ever release it and
-            # the run could never be resumed (Phase F review M1). Free it: the
-            # graph stays 'running' with no owner, which recovery picks up.
+            # the run could never be resumed (Phase F review M1, delta M-B).
+            # Free it: the graph stays 'running' with no owner, which
+            # recovery picks up.
             with db.connect(Path(self.opts.db_path)) as conn:
                 lease.release(conn, run_id, self.engine.owner)
             raise

@@ -173,12 +173,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         target = next((t for t in config.targets() if t["id"] == args.target_id), {"id": args.target_id})
         async def go():
             async with app.Session(app.Options(db_path=db_path)) as session:
-                run_id, gid = session.engine.start_run(target, kind="reflect")
-                await session.memory.open(run_id)
-                try:
-                    return [await session.engine.run_graph(gid)]
-                finally:
-                    await session.memory.close()
+                return [await session.run_reflect(target)]
         return _print_outcomes(asyncio.run(go()))
     if args.command == "dashboard":
         from argus.dashboard import serve

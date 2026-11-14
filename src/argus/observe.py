@@ -30,7 +30,7 @@ def _dur(a: Optional[str], b: Optional[str]) -> Optional[float]:
 def runs(db_path: Path, limit: int = 50) -> List[Dict[str, Any]]:
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT r.run_id, r.target_id, r.status, r.started_at, r.finished_at, "
+            "SELECT r.run_id, r.target_id, r.status, r.started_at, r.finished_at, r.error, "
             "g.graph_id, g.kind, g.status AS graph_status, g.tokens_used, g.seconds_used, "
             "(SELECT COUNT(*) FROM graph_nodes n WHERE n.graph_id = g.graph_id) AS nodes, "
             "(SELECT COUNT(*) FROM llm_calls c WHERE c.graph_id = g.graph_id) AS calls "

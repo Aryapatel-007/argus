@@ -331,3 +331,30 @@ July" kept every word on a page that now says "February, July and
 November", so a real change was reported as unchanged. Overlap tests miss
 lists that grow. The cost: a page that only rewords a fact now reports it as
 modified (scenario s08 measures how often).
+
+## D-027 — "Still stated" is an anchored whole statement (refines D-026)
+
+**Chose:** a stored fact is unchanged when it appears on the page as a whole
+statement: starting at a word boundary and ending at a sentence or line end
+(a "." that starts a decimal is not an end). A numeric fact whose new
+extraction has exactly the same numbers and >= 75% mutual word overlap is
+also unchanged (a re-phrasing of the same value). Number-free facts do not
+get that second path.
+**Rejected:** D-026's unanchored substring.
+**Why:** delta review H-B: "IELTS overall 6" was "stated" on a page saying
+6.5, "Places: 12" inside "120", and a list extended after the old text still
+matched. Review M-A: a re-worded extraction of an unchanged fee became a
+false "modified"; s08 now requires silence so Phase G measures it.
+
+## D-028 — The browser checks every redirect hop itself
+
+**Chose:** the route guard fetches each request with redirects off and
+checks every Location before following (max 5 hops); a top-level navigation
+may only move within its own origin; robots.txt follows only same-origin
+hops; an unreachable robots.txt means disallow. Origins compare host plus a
+non-default port, so http->https upgrades stay same-site.
+**Rejected:** letting Chromium follow redirects.
+**Why:** delta review H-A: Playwright calls a route handler only for the
+first URL of a redirect chain, so a public or same-origin URL could bounce a
+request into the LAN. Proven by a test with a real HTTP 302 from the page's
+own origin, plus a negative control where the 302 lands.

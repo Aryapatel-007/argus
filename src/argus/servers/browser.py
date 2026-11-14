@@ -56,31 +56,50 @@ MAX_LINKS = 200
 
 
 def _host_of(url: str) -> str:
-    """'host:port' (www. folded, default ports filled in). The port matters:
+    """Origin key: host (lowercase, punycode, trailing dot and www. folded),
+    plus the port ONLY when it is explicit and not the scheme's default.
+
+    So http://uni.edu and https://uni.edu are the same site (an http->https
+    upgrade is allowed, matching handlers.same_site; delta review M-G), while
     127.0.0.1:8765 (a fixture site) and 127.0.0.1:8787 (the dashboard) are
-    different origins."""
+    different origins. IPv6 hosts are bracketed so the port split is
+    unambiguous."""
     try:
         u = urlparse(url)
-        h = (u.hostname or "").lower()
-        port = u.port or {"http": 80, "https": 443}.get(u.scheme)
+        h = (u.hostname or "").lower().rstrip(".")
+        port = u.port
     except ValueError:
         return ""
     if not h:
         return ""
+    try:
+        h = h.encode("idna").decode("ascii")  # page.url is punycode; compare like with like
+    except UnicodeError:
+        pass
     h = h[4:] if h.startswith("www.") else h
+    if ":" in h:
+        h = f"[{h}]"
+    if port is None or port == {"http": 80, "https": 443}.get(u.scheme):
+        return h
     return f"{h}:{port}"
 
 
-def _internal(host: str) -> bool:
-    # `host` is a _host_of key ("name:port", IPv6 without brackets): drop the port.
-    host = host.rsplit(":", 1)[0].strip("[]")
+def _internal(key: str) -> bool:
+    """True for loopback, private, link-local, CGNAT and every other
+    non-global address, and for localhost names (trailing dots folded)."""
+    host = key
+    if host.startswith("["):
+        host = host[1:host.index("]")]
+    elif host.count(":") == 1:
+        host = host.rsplit(":", 1)[0]
+    host = host.rstrip(".")
     if host in ("localhost", "localhost.localdomain") or host.endswith(".localhost"):
         return True
     try:
-        ip = ipaddress.ip_address(host.strip("[]"))
+        ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified
+    return not ip.is_global
 
 
 def request_allowed(request_url: str, page_host: str) -> bool:
@@ -137,7 +156,7 @@ class BrowserBackend:
         async with self._launch_lock:
             if self._browser is not None and not self._browser.is_connected():
                 log("chromium disconnected; relaunching")  # review M4
-                self._browser = None
+                await self._drop_browser()
             if self._browser is None:
                 from playwright.async_api import async_playwright
 
@@ -145,6 +164,18 @@ class BrowserBackend:
                 self._browser = await self._pw.chromium.launch(headless=True)
                 log("chromium launched")
         return self._browser
+
+    async def _drop_browser(self) -> None:
+        """Forget the current Chromium AND stop its Playwright driver, so a
+        relaunch does not leak the old processes (delta review, low)."""
+        browser, pw, self._browser, self._pw = self._browser, self._pw, None, None
+        for closer in ((browser.close if browser is not None else None), (pw.stop if pw is not None else None)):
+            if closer is None:
+                continue
+            try:
+                await asyncio.wait_for(closer(), timeout=10)
+            except Exception as exc:  # noqa: BLE001 - it is already gone or wedged
+                log(f"cleanup of old browser failed: {exc!r}")
 
     async def close(self) -> None:
         if self._browser is not None:
@@ -170,7 +201,19 @@ class BrowserBackend:
         if origin not in self._robots:
             parser: Optional[urllib.robotparser.RobotFileParser] = None
             try:
-                resp = await context.request.get(origin + "/robots.txt", timeout=10_000)
+                # No automatic redirects (review H-A): follow at most five
+                # same-origin hops ourselves; a cross-origin robots redirect
+                # is not followed and reads as "no robots.txt".
+                target = origin + "/robots.txt"
+                resp = await context.request.get(target, timeout=10_000, max_redirects=0)
+                for _ in range(5):
+                    if resp.status not in (301, 302, 303, 307, 308):
+                        break
+                    nxt = urljoin(target, resp.headers.get("location", ""))
+                    if _host_of(nxt) != _host_of(origin):
+                        break
+                    target = nxt
+                    resp = await context.request.get(target, timeout=10_000, max_redirects=0)
                 if resp.ok:
                     parser = urllib.robotparser.RobotFileParser()
                     parser.parse((await resp.text()).splitlines())
@@ -178,8 +221,10 @@ class BrowserBackend:
                     # RFC 9309: a server error on robots.txt means disallow.
                     parser = urllib.robotparser.RobotFileParser()
                     parser.parse(["User-agent: *", "Disallow: /"])
-            except Exception as exc:  # noqa: BLE001 - no robots.txt reachable: allowed
-                log(f"robots.txt unavailable for {origin}: {exc!r}")
+            except Exception as exc:  # noqa: BLE001 - RFC 9309: unreachable means disallow
+                log(f"robots.txt unreachable for {origin}: {exc!r}; treating as disallow")
+                parser = urllib.robotparser.RobotFileParser()
+                parser.parse(["User-agent: *", "Disallow: /"])
             self._robots[origin] = parser
         parser = self._robots[origin]
         return parser is None or parser.can_fetch(USER_AGENT, url)
@@ -200,7 +245,7 @@ class BrowserBackend:
             context = await browser.new_context(user_agent=USER_AGENT, accept_downloads=False,
                                                 java_script_enabled=True)
         except Exception as exc:  # noqa: BLE001 - Chromium died: relaunch next time, degrade now
-            self._browser = None
+            await self._drop_browser()
             return PageResult(url=url, ok=False, partial=True, confidence=0.0,
                               error=f"browser context failed: {exc!r}", elapsed_s=time.monotonic() - start)
         self.open_contexts += 1
@@ -208,11 +253,40 @@ class BrowserBackend:
         blocked: List[str] = []
 
         async def guard(route):
-            if request_allowed(route.request.url, page_host):
-                await route.continue_()
-            else:
-                blocked.append(route.request.url)
+            """Every request, every redirect hop (delta review H-A).
+
+            Playwright calls a route handler only for the FIRST url of a
+            redirect chain, so letting the browser follow redirects would let
+            a public URL bounce a request into the LAN. Instead the request is
+            fetched with redirects off and each Location is checked before
+            the next hop. A top-level navigation may only move within its own
+            origin."""
+            req = route.request
+            url = req.url
+            if not request_allowed(url, page_host):
+                blocked.append(url)
                 await route.abort("blockedbyclient")
+                return
+            try:
+                resp = await route.fetch(max_redirects=0)
+                for _ in range(5):
+                    if resp.status not in (301, 302, 303, 307, 308):
+                        break
+                    nxt = urljoin(url, resp.headers.get("location", ""))
+                    if not request_allowed(nxt, page_host) or (
+                            req.is_navigation_request() and _host_of(nxt) != page_host):
+                        blocked.append(nxt)
+                        await route.abort("blockedbyclient")
+                        return
+                    url = nxt
+                    resp = await route.fetch(url=url, max_redirects=0)
+                await route.fulfill(response=resp)
+            except Exception as exc:  # noqa: BLE001 - one failed subresource is not fatal
+                blocked.append(f"{url} ({type(exc).__name__})")
+                try:
+                    await route.abort("failed")
+                except Exception:  # noqa: BLE001 - already handled
+                    pass
 
         try:
             await context.route("**/*", guard)

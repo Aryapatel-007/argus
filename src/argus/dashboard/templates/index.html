@@ -8,7 +8,8 @@
 {% for r in runs %}
 <tr><td class="mono">{{ r.started_at }}</td><td class="mono"><a href="/runs/{{ r.run_id }}">{{ r.run_id }}</a></td>
 <td>{{ r.target_id }}</td><td>{{ r.kind or "legacy" }}</td>
-<td class="s-{{ r.graph_status or r.status }}">{{ r.graph_status or r.status }}</td>
+<td class="s-{{ r.graph_status or r.status }}">{{ r.graph_status or r.status }}
+{% if r.error %}<br><span class="s-failed">{{ r.error[:160] }}</span>{% endif %}</td>
 <td>{{ r.nodes or 0 }}</td><td>{{ r.calls or 0 }}</td><td>{{ r.tokens_used or 0 }}</td></tr>
 {% else %}<tr><td colspan="8" class="muted">No runs yet. Try <code>argus watch</code>.</td></tr>{% endfor %}
 </table></div>
