@@ -4,8 +4,10 @@ Local-first autonomous multi-agent monitoring system. Watches a list of targets
 (companies, topics, job postings), checks them on a schedule, remembers what it
 finds, detects changes, and proposes actions that always wait for human approval.
 
-Solo project, built by a BTech CSE student as a portfolio centerpiece. Built in
-sprints, currently Sprint 2.
+Solo project, built by a BTech CSE student as a portfolio centerpiece.
+Sprints are retired. The build now runs in phases defined in `ARGUS_BUILD.md`.
+**Every session: read `BUILD_STATE.md` first, then this file, then
+`ARGUS_BUILD.md`.**
 
 ---
 
@@ -31,23 +33,20 @@ exception is intended.
 - Asus ROG Strix G16, i7-13650HX (14 cores / 20 threads)
 - 16GB system RAM, typically 5GB free
 - RTX 4060 Laptop, 8GB VRAM, ~7.6GB usable
-- Windows 11, PowerShell 7.6
-- Python 3.11.9
+- Windows 11, PowerShell 7.6, Python 3.11.9
 - NVIDIA driver 610.88, CUDA 13.3
 - Ollama CLI 0.24.0, `ollama` Python package 0.6.2 — different numbers, don't
-  conflate them
+  conflate them. Live versions: `notes/environment.md`.
 
 **Measured, not assumed.** `qwen3.5:9b` at Q4_K_M needs ~8.2GB total (4.0GB GPU
 weights + 2.2GB output layer + 1.4GB KV cache + 0.55GB compute graph) against a
-~7.6GB ceiling. Ollama pushes the output layer to CPU. That is one layer of 33,
-but a disproportionately heavy one, which is why `ollama ps` reports a ~70/30
-GPU/CPU split. Layer count and memory share measure different things; both
-readings are correct.
-
-Throughput ~19-21 tok/s on that split. Cold load 6.00s, warm 0.12s.
+~7.6GB ceiling. Ollama pushes the output layer to CPU: one layer of 33, but a
+heavy one, which is why `ollama ps` reports a ~70/30 GPU/CPU split. Throughput
+~19-21 tok/s on that split. Cold load 6.00s, warm 0.12s.
 
 **Assume VRAM is scarce.** Two chat models never co-reside. Qwen 9B (6.6GB) +
-Phi-4-mini (2.5GB) = 9.1GB against 7.6GB. Every alternation costs a 6s reload.
+Phi-4-mini (2.5GB) = 9.1GB against 7.6GB. Every alternation costs a reload.
+The graph router treats swap cost as a first-class term (ARGUS_BUILD.md 6.2).
 
 ---
 
@@ -59,82 +58,55 @@ on thinking. Measured (`notes/sprint1_thinking_probe.json`), one-sentence prompt
 - thinking on (default): 1228-1561 eval tokens, 67-83s
 - `think=False`: 37 eval tokens, 2.1s
 
-~35x faster, ~97.6% of generation was reasoning.
-
-- `think="low"` is NOT a middle setting here. It is silently coerced to True and
-  produces byte-identical results to `think=True`. Thinking is binary on this
-  model. Do not use levels.
+- `think="low"` is NOT a middle setting here. It is silently coerced to True.
+  Thinking is binary on this model. Do not use levels.
 - `format=` JSON schema composes with `think=False` at zero measured cost.
-- One `think=True` run went runaway: 6163 tokens, 1583s, **empty content**, with
-  tok/s collapsing to 3.9 under a heavier CPU offload. With thinking on,
-  generation length is unbounded and can return nothing at all. A weekly
-  scheduled system cannot contain a step that might take 26 minutes and yield
-  an empty string.
+- With thinking on, generation length is unbounded: one run took 1583s and
+  returned **empty content**. The writer probe (Phase C) saw 5 of 7 thinking
+  runs exceed a 300s kill. `think=False` on every call, every role, every model.
 
 ---
 
 ## Architecture
 
 - **Scheduler** — APScheduler, in-process, daily or weekly triggers.
-- **Orchestrator** — hand-built plan/act/observe/critique state machine.
-  Based on ReAct (reasoning + acting interleaved) and Reflexion (self-critique
-  on failure feeds the retry).
+- **Orchestrator** — being replaced by a typed, dynamically expanding task
+  graph (ARGUS_BUILD.md Phase E): validator, router, two-lane scheduler,
+  graph-level checkpoints. The Sprint 1 linear loop
+  (`src/argus/orchestrator/loop.py`) stays until its behaviour is ported.
+  Hand-built. ReAct + Reflexion ideas, no agent framework.
 - **Tool servers** — custom MCP servers built with the official Python SDK:
   - Memory server: `remember_fact`, `recall_facts`, `list_changes_since`
-  - Browser server: `search`, `open_page`, `extract_structured`
-- **Models via Ollama:**
-  - Planner / critic / writer / judge: `qwen3.5:9b`
-  - `phi4-mini`: pulled, in the architecture, unused until Sprint 7 gives real
-    routing data. At 2.1s per call a swap to it costs 6s to save ~1s.
-  - Embeddings: `nomic-embed-text`, 768 dimensions (fixes sqlite-vec column
-    width in Sprint 2)
+  - Browser server: raw Playwright (D-002), page text out, no selectors
+- **Models via Ollama:** a measured pool, not fixed tiers. Which models are
+  allowed lives in config; what they are good at lives in the database
+  (`model_profiles`, `arm_stats`). Embeddings: `nomic-embed-text`, 768 dims.
 - **Storage** — single SQLite file, WAL mode, sqlite-vec extension for vectors.
 
-### Core loop, per target, per run
-
-1. Plan what to check
-2. Act — call a tool
-3. Observe the real result
-4. Critique — good enough? If not, write a reflection and retry the act step
-5. Externally visible? If no, save to memory. If yes, queue for approval and wait
-
-Every state transition is checkpointed to SQLite immediately, in one transaction,
-so a crash resumes from the last completed step. Side-effecting actions carry an
-idempotency key generated and stored *before* the action runs.
-
-### Schema
-
-- `runs` — one row per scheduled execution
-- `tasks` — sub-tasks the planner generated within a run
-- `checkpoints` — state after every transition
-- `llm_calls` — every Ollama call with latency, tok/s, token counts
-- `facts` — versioned knowledge per target (Sprint 2, migration 002)
-- `approvals` — pending and resolved human decisions (Sprint 2, migration 002)
+Every state transition is checkpointed to SQLite in the same transaction as
+the transition, so a crash resumes from the last completed step. Side-effecting
+actions carry an idempotency key on `approvals`, generated and stored *before*
+the action runs.
 
 ---
 
 ## Design decisions already made — don't relitigate these
 
-- **Hand-built state machine before LangGraph.** Deliberate. The point is
-  understanding what a checkpointer and idempotent retry actually solve. Do not
-  suggest migrating to LangGraph during early sprints.
-- **Kept `qwen3.5:9b` despite the partial CPU offload.** Do not propose dropping
-  to 4b. The latency problem was thinking tokens, not model size or inference
-  speed. Smaller models are worse at structured output, which is exactly what
-  the planner and critic depend on.
-- **Single model for all roles in Sprint 1.** Zero swaps. Model bindings per role
-  come from config, so routing to `phi4-mini` later is a config change, not a
-  refactor.
-- **Local models over hosted APIs.** Accepted tradeoff: local models are worse at
-  structured output. That is *why* deterministic validation and retry logic wrap
-  every tool call and judge call.
-- **Custom MCP servers, not just consuming existing ones.** Deliberate skill
-  investment plus no existing server fits the memory design.
-- **sqlite-vec over Chroma.** Embedded, no separate process, fact count stays in
-  the thousands.
-- **Browser Use layered on Playwright**, not hand-coded selectors. Page layouts
-  vary across dozens of uncontrolled sites. Raw Playwright stays available as a
-  fallback for specific hand-tuned pages.
+Full reasoning: `design-decisions.md` (Sprints 0-2) and `notes/decisions-log.md`
+(numbered, Phase A onward).
+
+- **Hand-built orchestration.** No LangGraph, CrewAI, AutoGen or any agent
+  framework. Narrow libraries (MCP SDK, sqlite-vec, Playwright, APScheduler)
+  are fine.
+- **Kept `qwen3.5:9b` despite the partial CPU offload.** The latency problem
+  was thinking tokens, not model size.
+- **Local models over hosted APIs.** Local models are worse at structured
+  output, which is *why* deterministic validation and retry wrap every call.
+- **Custom MCP servers**, not only consuming existing ones.
+- **sqlite-vec over Chroma.** Embedded, no separate process.
+- **Raw Playwright, not Browser Use** (D-002, supersedes the Sprint 0 entry).
+- **Idempotency key lives on `approvals`**, not tasks.
+- **Embeddings are generated inside the memory server.**
 
 ---
 
@@ -142,12 +114,14 @@ idempotency key generated and stored *before* the action runs.
 
 ```
 argus/
+  ARGUS_BUILD.md   the build directive (phases A-G)
+  BUILD_STATE.md   where the build is; read first every session
   config/          targets.yaml — what Argus watches
   data/            SQLite file (gitignored)
-  notes/           sprint measurements and findings
-  scripts/         one-off runners, smoke tests, probes
+  notes/           measurements, audit, decisions-log.md
+  scripts/         one-off runners, smoke tests, probes, crash tests
   src/argus/
-    orchestrator/  the plan-act-critique state machine
+    orchestrator/  Sprint 1 linear loop (until ported)
     servers/       MCP servers (memory, browser)
     storage/       schema, migrations, sqlite-vec setup
   tests/
@@ -158,14 +132,12 @@ argus/
 ## Conventions
 
 - Python 3.11, plain `venv` at `.venv/`, activated before any work.
-- Install dependencies only in the sprint that needs them. Do not pre-install
-  MCP SDK, sqlite-vec, Browser Use, or APScheduler ahead of time — version drift
-  before first use is a real cost.
-- Pin `mcp>=2.0,<3`. Re-examined in Sprint 2: v2 is the stable line as of
-  2026-07-28 and `pip install mcp` resolves to it. v1 is maintenance-only.
-  The port from v1 course material is small for a decorator-built server:
-  `from mcp.server import MCPServer` replaces
-  `from mcp.server.fastmcp import FastMCP`; `@mcp.tool()` is unchanged.
+- **All dependencies are installed and pinned up front** in `requirements.txt`
+  and `requirements-dev.txt` (D-006). Add a pin when adding a dependency.
+- Tests: `python -m pytest` (pytest.ini sets `pythonpath = src`). Older suites
+  are unittest classes; pytest collects them. The passing count never goes
+  down; it is recorded in BUILD_STATE.md at every commit.
+- `mcp` is the v2 line. `from mcp.server import MCPServer`, `@mcp.tool()`.
 - MCP tools are always `async def`. In v2 a sync `def` tool runs on a worker
   thread, and `sqlite3.Connection` is thread-affine.
 - A stdio MCP server owns stdout. All logging goes to stderr or a file.
@@ -174,19 +146,19 @@ argus/
   `conn.load_extension()`. On Windows `loadable_path()` returns a path with
   no extension and that bare path does not exist; `load()` resolves it.
 - `think` is a TOP-LEVEL field on Ollama chat/generate, not inside `options`.
-  Pass `think=False` explicitly on EVERY call, every role. Never rely on the
-  default.
-- Never use `num_predict` as a thinking cap. With thinking on it truncates
-  mid-reasoning and returns no answer.
-- Every Ollama call needs a hard 120s timeout and must log tok/s. A degraded
-  CPU offload has been observed dropping throughput 5x mid-session.
+  Pass `think=False` explicitly on EVERY call. Never rely on the default.
+- Never use `num_predict` as a thinking cap.
+- Every Ollama call needs a hard 120s timeout and must log tok/s, including
+  calls that time out. Throughput has been seen dropping 5x mid-session.
 - The state transition and its checkpoint insert go in ONE transaction.
-- Async by default for anything I/O-bound. Use `httpx.AsyncClient`, never
+- Every write goes through `db.atomic()` (BEGIN IMMEDIATE). No second helper.
+- Async by default for anything I/O-bound. `httpx.AsyncClient`, never
   blocking `requests` inside an `async def`.
 - Model tags come from config, never hardcoded in source.
-- Log structured rows, not print statements. Every plan, every tool call with
-  latency and token count, every critic verdict.
-- On Windows, `python` not `python3`.
+- Log structured rows, not print statements.
+- On Windows, `python` not `python3`. Child processes are NOT killed with
+  their parent; kill and verify by process listing.
+- Never commit Co-Authored-By trailers or Claude attribution (global rule).
 
 ---
 
@@ -208,22 +180,20 @@ non-negotiable, on every connection in both processes:
 Verified in Sprint 2: two processes, 200 BEGIN IMMEDIATE writes each,
 400 rows landed, zero OperationalError.
 
-Table ownership: orchestrator owns runs, tasks, checkpoints. Memory server
-owns facts, facts_vec. Both write llm_calls — the memory server logs its
-embedding calls with role='embedder'. The write lock is database-wide, not
-per-table; ownership is for clarity, not for concurrency.
+Table ownership: orchestrator owns runs, tasks, checkpoints and the graph
+tables. Memory server owns facts, facts_vec. Both write llm_calls — the memory
+server logs its embedding calls with role='embedder'. The write lock is
+database-wide; ownership is for clarity, not for concurrency.
 
 Only the orchestrator runs migrations. The memory server reads the
-schema_migrations table at startup and exits with a clear error unless
-migration 002 is present and applied. It never runs migrations itself.
+schema_migrations table at startup and exits with a clear error unless its
+required migration is applied. It never runs migrations itself.
 
 Migration state lives in the `schema_migrations` table — one row per applied
 filename. `PRAGMA user_version` is NOT used and reads 0 even on a fully
-migrated database, so anything that trusts it concludes nothing has run.
-Guarded by a test, so the two can't start disagreeing silently.
+migrated database. Guarded by a test.
 
-Load sqlite-vec on every connection that opens the file, including the
-orchestrator's.
+Load sqlite-vec on every connection that opens the file.
 
 ---
 
@@ -233,53 +203,20 @@ orchestrator's.
 - Explain *where and when* something is used in Argus, not abstract theory.
 - Short sentences. Plain language. Complete, copy-pasteable code blocks.
 - If you are unsure of exact syntax, a version number, or an API detail, say so
-  and point me at official docs. Do not guess and do not invent APIs.
+  and check official docs. Do not guess and do not invent APIs.
 - Don't re-teach LangChain, LangGraph, MCP, Playwright, or async Python at a
   beginner level — I know these.
 - Confirm each step worked before moving to the next.
-- Design decisions get made in a separate architect chat, not here. If you hit a
-  design question this file doesn't answer, stop and tell me rather than
-  deciding it yourself.
+- **You make design decisions yourself** (D-001). Record each one in
+  `notes/decisions-log.md`: chosen, rejected, why. Stop and write
+  `BLOCKED: needs Arya` at the top of BUILD_STATE.md only for the cases in
+  ARGUS_BUILD.md section 1.4 (hard-constraint conflict, touching real data in
+  data/argus.db, force push or history rewrite, credentials or paid accounts,
+  disk under 15GB before pulls, Phase G graph engine losing to baseline).
 
 ---
 
-## Current state — Sprint 2
+## Current state
 
-Sprint 1 closed. Hand-built plan/act/observe/critique state machine,
-SQLite-checkpointed after every transition. Crash-resume proven against real
-Ollama for both LLM-call-in-flight scenarios (planner and critic), 24/24
-checks each. The between-steps window (~0-6ms) was tested across 5 attempts
-and recorded as INCONCLUSIVE — too narrow for a separate process to reliably
-target. Unit tests exercise the same transition logic but do not close this
-gap; it stays open. Migration chain at 001c.
-
-Sprint 2 goal: the memory server as a real custom MCP server, SQLite plus
-sqlite-vec, tested standalone before the orchestrator touches it.
-
-Decisions made at the top of Sprint 2:
-- MCP SDK v2, replacing the earlier `mcp<2` pin.
-- Embeddings are generated inside the memory server, not the orchestrator.
-  Tool surface stays semantic (`query: str`), write/query symmetry is
-  guaranteed by construction, and no 768-float arrays cross stdio.
-- The memory server is spawned per run and receives `--run-id`, so embedding
-  calls are attributable in llm_calls without polluting the model-facing
-  tool schema.
-- Idempotency key lives on `approvals`, not `tasks`. It must survive across
-  runs; a task does not. `tasks.idempotency_key` is dropped in 002.
-- Retrieval ships relevance + recency at 0.7/0.3. The `importance` column
-  exists in 002 but stays NULL until Sprint 5, treated as a neutral constant
-  by the scorer.
-- Entity resolution in Sprint 2 is exact `entity_key` match only. Fuzzy
-  matching is Sprint 4.
-
-Measured in Sprint 2 Step 0:
-- qwen3.5:9b and nomic-embed-text ARE co-resident. Embeddings run inline per
-  fact. No batching, no swap cost.
-- sqlite-vec 0.1.9 loads cleanly on Windows via sqlite_vec.load().
-- Node 24.11.1, past the 22.19.0 floor for MCP Inspector v2.
-
-Open and unverified:
-- `think=False` quality on writer-shaped prompts. Probe before wiring.
-- Co-residency was measured with nothing else running. Sprint 3 adds a
-  browser; re-measure then.
-- Single-shot planner. Sprint 4. Do not fix here.
+See `BUILD_STATE.md`. Sprint 1 and Sprint 2 history: `notes/sprint-1.md`,
+`notes/sprint-2.md` (its last section is the Sprint 2 closing state).

@@ -1,2 +1,28 @@
-ollama
-pyyaml
+# Runtime dependencies. Direct deps only, pinned exactly.
+# Installed together in Phase A (see notes/environment.md), not per sprint.
+# After install, also run once:  python -m playwright install chromium
+
+ollama==0.6.2
+pyyaml==6.0.3
+pydantic==2.13.4
+httpx==0.28.1
+
+# MCP SDK v2 line (decided Sprint 2). Server + client over stdio.
+mcp==2.0.0
+
+# Vector search inside the SQLite file. 768-dim facts_vec.
+sqlite-vec==0.1.9
+
+# Browser tool server. Raw Playwright; Browser Use was rejected in Phase A
+# (telemetry on by default, cloud endpoints, exact pins on mcp/pydantic).
+# See notes/decisions-log.md D-002.
+playwright==1.65.2
+
+# In-process scheduler (3.x is the stable line; 4.x is pre-release).
+apscheduler==3.11.3
+
+# Local dashboard. FastAPI + Jinja2 server-rendered pages, served by uvicorn.
+# Streamlit rejected: usage-stats collection is on by default. D-003.
+fastapi==0.162.7
+jinja2==3.1.6
+uvicorn==0.52.4

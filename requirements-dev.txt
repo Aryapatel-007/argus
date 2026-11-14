@@ -1,0 +1,4 @@
+# Test-only tools. Install with:  pip install -r requirements.txt -r requirements-dev.txt
+pytest==9.2.0
+pytest-asyncio==1.5.0
+hypothesis==6.170.15

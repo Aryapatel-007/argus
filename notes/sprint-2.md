@@ -871,3 +871,51 @@ Row counts after cleanup: `runs=10, facts=0, facts_vec=0, llm_calls=25` —
 an exact match against the state recorded before the Inspector session
 began. `PRAGMA integrity_check` clean, zero FK violations. The real dev
 database carries no debris from this investigation.
+
+---
+
+## Sprint 2 closing state (moved verbatim from CLAUDE.md in Phase A, 2026-11-14)
+
+CLAUDE.md had grown past its 250-line limit. This section is what it said
+about Sprint 2 when sprints were retired in favour of ARGUS_BUILD.md phases.
+
+### Current state — Sprint 2
+
+Sprint 1 closed. Hand-built plan/act/observe/critique state machine,
+SQLite-checkpointed after every transition. Crash-resume proven against real
+Ollama for both LLM-call-in-flight scenarios (planner and critic), 24/24
+checks each. The between-steps window (~0-6ms) was tested across 5 attempts
+and recorded as INCONCLUSIVE — too narrow for a separate process to reliably
+target. Unit tests exercise the same transition logic but do not close this
+gap; it stays open. Migration chain at 001c.
+
+Sprint 2 goal: the memory server as a real custom MCP server, SQLite plus
+sqlite-vec, tested standalone before the orchestrator touches it.
+
+Decisions made at the top of Sprint 2:
+- MCP SDK v2, replacing the earlier `mcp<2` pin.
+- Embeddings are generated inside the memory server, not the orchestrator.
+  Tool surface stays semantic (`query: str`), write/query symmetry is
+  guaranteed by construction, and no 768-float arrays cross stdio.
+- The memory server is spawned per run and receives `--run-id`, so embedding
+  calls are attributable in llm_calls without polluting the model-facing
+  tool schema.
+- Idempotency key lives on `approvals`, not `tasks`. It must survive across
+  runs; a task does not. `tasks.idempotency_key` is dropped in 002.
+- Retrieval ships relevance + recency at 0.7/0.3. The `importance` column
+  exists in 002 but stays NULL until Sprint 5, treated as a neutral constant
+  by the scorer.
+- Entity resolution in Sprint 2 is exact `entity_key` match only. Fuzzy
+  matching is Sprint 4.
+
+Measured in Sprint 2 Step 0:
+- qwen3.5:9b and nomic-embed-text ARE co-resident. Embeddings run inline per
+  fact. No batching, no swap cost.
+- sqlite-vec 0.1.9 loads cleanly on Windows via sqlite_vec.load().
+- Node 24.11.1, past the 22.19.0 floor for MCP Inspector v2.
+
+Open and unverified:
+- `think=False` quality on writer-shaped prompts. Probe before wiring.
+- Co-residency was measured with nothing else running. Sprint 3 adds a
+  browser; re-measure then.
+- Single-shot planner. Sprint 4. Do not fix here.
